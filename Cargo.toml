@@ -1,0 +1,34 @@
+[package]
+name = "esp-wifi-ap"
+version = "0.1.0"
+authors = ["Lukasz Gintowt <syzer3@gmail.com>"]
+edition = "2021"
+resolver = "2"
+rust-version = "1.77"
+
+[[bin]]
+name = "esp-wifi-ap"
+harness = false # do not use the built in cargo test harness -> resolve rust-analyzer errors
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true    # Symbols are nice and they don't increase the size on Flash
+opt-level = "z"
+
+[features]
+default = []
+
+experimental = ["esp-idf-svc/experimental"]
+
+[dependencies]
+log = "0.4"
+esp-idf-svc = { version = "0.51", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
+anyhow = "1.0.98"
+heapless = "0.8.0"
+embedded-svc = "0.28.1"
+
+[build-dependencies]
+embuild = "0.33"
+dotenvy = "0.15"
