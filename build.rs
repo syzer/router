@@ -9,5 +9,11 @@ fn main() {
         }
     }
 
+    for key in ["ST_SSID", "ST_PASS"] {
+        if let Ok(val) = std::env::var(key) {
+            println!("cargo:rustc-env={key}={val}");
+        }
+    }
+
     embuild::espidf::sysenv::output();
 }
