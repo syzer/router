@@ -19,15 +19,21 @@ opt-level = "z"
 
 [features]
 default = []
-
 experimental = ["esp-idf-svc/experimental"]
 
 [dependencies]
 log = "0.4"
-esp-idf-svc = { version = "0.51", features = ["critical-section", "embassy-time-driver", "embassy-sync"] }
 anyhow = "1.0.98"
 heapless = "0.8.0"
-embedded-svc = "0.28.1"
+
+# Espressif crates
+esp-idf-sys    = "0.36"
+esp-idf-svc    = "0.51"
+esp-idf-hal    = "0.45"
+
+# On-board WS2812 LED (GPIO-8)
+ws2812-esp32-rmt-driver = { version = "0.12.0", features = ["smart-leds-trait"]}
+smart-leds              = "0.4"
 
 [build-dependencies]
 embuild = "0.33"
