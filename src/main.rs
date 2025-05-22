@@ -9,6 +9,15 @@ use esp_idf_svc::handle::RawHandle;
 use esp_idf_sys as sys;
 use sys::{esp, esp_netif_napt_enable};
 use esp_idf_svc::netif::EspNetif;
+use esp_idf_svc::hal::{
+    gpio::{InterruptType, PinDriver, Pull},
+    peripherals::Peripherals,
+    task::notification::Notification,
+};
+use smart_leds_trait::SmartLedsWrite;
+use std::num::NonZeroU32;
+
+// use ws2812_esp32_rmt_driver::{RGB8, Ws2812Rmt};
 
 const AP_SSID: &str = env!("AP_SSID");
 const AP_PASS: &str = env!("AP_PASS");
@@ -70,9 +79,32 @@ fn main() -> anyhow::Result<()> {
     enable_nat(&ap)?;
     info!("NAPT enabled – AP clients have Internet!");
 
+
+    let peripherals = Peripherals::take()?;            // singleton?
+
+    // Push-button on GPIO9, pulled high when idle
+    let mut button = PinDriver::input(peripherals.pins.gpio9)?;
+    button.set_pull(Pull::Up)?;
+    button.set_interrupt_type(InterruptType::PosEdge)?;
+
+    // Async notification object
+    let notification = Notification::new();
+    let notifier = notification.notifier();
+
+    // SAFETY: the `Notification` outlives the interrupt subscription
+    unsafe {
+        button.subscribe(move || {
+            notifier.notify_and_yield(NonZeroU32::new(1).unwrap());
+        })?;
+    }
+
     loop {
+        // Arm the interrupt and wait
+        button.enable_interrupt()?;
+        notification.wait(esp_idf_svc::hal::delay::BLOCK);
+
         println!(".");
-        std::thread::sleep(std::time::Duration::from_secs(60));
+        // std::thread::sleep(std::time::Duration::from_secs(60));
         // std::thread::sleep(std::time::Duration::from_millis(25));
     }
 
