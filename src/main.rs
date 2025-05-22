@@ -16,8 +16,7 @@ use esp_idf_svc::hal::{
 };
 use smart_leds_trait::SmartLedsWrite;
 use std::num::NonZeroU32;
-
-// use ws2812_esp32_rmt_driver::{RGB8, Ws2812Rmt};
+use esp_idf_svc::hal::delay::FreeRtos;
 
 const AP_SSID: &str = env!("AP_SSID");
 const AP_PASS: &str = env!("AP_PASS");
@@ -28,6 +27,36 @@ const ST_PASS: &str = env!("ST_PASS");
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+
+    // button start
+    let peripherals = Peripherals::take()?;            // singleton?
+
+    // Push-button on GPIO9, pulled high when idle
+    let mut button = PinDriver::input(peripherals.pins.gpio9)?;
+    button.set_pull(Pull::Up)?;
+    button.set_interrupt_type(InterruptType::PosEdge)?;
+
+    // Async notification object
+    let notification = Notification::new();
+    let notifier = notification.notifier();
+
+    unsafe {
+        // SAFETY: the `Notification` outlives the interrupt subscription
+        match button.subscribe(move || {
+            if let Some(val) = NonZeroU32::new(1) { // .unwrap() is fine, this is just more explicit
+                notifier.notify_and_yield(val);
+            }
+        }) {
+            Ok(_) => {
+                info!("Successfully subscribed to button interrupt on GPIO {}", button.pin());
+            }
+            Err(e) => {
+                info!("Failed to subscribe to button interrupt on GPIO {}: {:?}", button.pin(), e);
+                () // javascript :D
+            }
+        }
+    }
+    // button end
 
     info!(".....Booting up Wi-Fi AP + STA bridge........");
 
@@ -79,38 +108,31 @@ fn main() -> anyhow::Result<()> {
     enable_nat(&ap)?;
     info!("NAPT enabled – AP clients have Internet!");
 
-
-    let peripherals = Peripherals::take()?;            // singleton?
-
-    // Push-button on GPIO9, pulled high when idle
-    let mut button = PinDriver::input(peripherals.pins.gpio9)?;
-    button.set_pull(Pull::Up)?;
-    button.set_interrupt_type(InterruptType::PosEdge)?;
-
-    // Async notification object
-    let notification = Notification::new();
-    let notifier = notification.notifier();
-
-    // SAFETY: the `Notification` outlives the interrupt subscription
-    unsafe {
-        button.subscribe(move || {
-            notifier.notify_and_yield(NonZeroU32::new(1).unwrap());
-        })?;
-    }
-
     loop {
         // Arm the interrupt and wait
         button.enable_interrupt()?;
         notification.wait(esp_idf_svc::hal::delay::BLOCK);
+        button.disable_interrupt()?;       // disarm
 
         println!(".");
-        // std::thread::sleep(std::time::Duration::from_secs(60));
-        // std::thread::sleep(std::time::Duration::from_millis(25));
+
+        // FreeRtos::delay_ms(60000);
+        FreeRtos::delay_ms(1000);
     }
 
-    pub fn enable_nat(ap: &EspNetif) -> anyhow::Result<()> {
-        unsafe { esp!(esp_netif_napt_enable(ap.handle()))? };
-        Ok(())
+    pub fn enable_nat(ap_netif_handle: &EspNetif) -> anyhow::Result<()> {
+        info!("Attempting to enable NAPT on netif handle: {:?}", ap_netif_handle.handle());
+        // Ensure the netif handle is valid and the interface is up.
+        unsafe {
+            let result = esp_netif_napt_enable(ap_netif_handle.handle());
+            if result == sys::ESP_OK {
+                info!("esp_netif_napt_enable call succeeded.");
+                Ok(())
+            } else {
+                info!("esp_netif_napt_enable call failed with error code: {}", result);
+                Err(anyhow::anyhow!("Failed to enable NAPT, ESP error code: {}", result))
+            }
+        }
     }
 
 }
