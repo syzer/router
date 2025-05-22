@@ -32,13 +32,20 @@ esp-idf-svc = { version = "0.51", features = [
     "alloc",
 ] }
 esp-idf-sys = { version = "0.36.1", features = ["native", "binstart"] }
+esp-idf-hal = { version = "0.45.2", features = [
+#    "rmt-legacy",
+] }
 
 anyhow = "1.0.98"
 heapless = "0.8.0"
 embedded-svc = "0.28.1"
 getrandom = "0.3.3"
 smart-leds-trait        = "0.3.1"
-ws2812-esp32-rmt-driver = "0.12.0"
+smart-leds = "0.4.0"
+embedded-hal            = "0.2.7"
+ws2812-esp32-rmt-driver = { version = "0.12", default-features = false, features = [
+    "smart-leds-trait"] }
+rgb = "0.8"         # <-- brings rgb::RGB8 into scope
 
 [build-dependencies]
 embuild = "0.33"

@@ -17,6 +17,8 @@ use esp_idf_svc::hal::{
 use smart_leds_trait::SmartLedsWrite;
 use std::num::NonZeroU32;
 use esp_idf_svc::hal::delay::FreeRtos;
+mod lib;
+use lib::{WS2812RMT, RGB8};  // RGB8 came from the `rgb` crate
 
 const AP_SSID: &str = env!("AP_SSID");
 const AP_PASS: &str = env!("AP_PASS");
@@ -57,6 +59,11 @@ fn main() -> anyhow::Result<()> {
         }
     }
     // button end
+
+    let mut led = WS2812RMT::new(
+        peripherals.pins.gpio8,      // <- ESP32-C6 built-in RGB LED
+        peripherals.rmt.channel0,   // any free TX channel
+    )?;
 
     info!(".....Booting up Wi-Fi AP + STA bridge........");
 
@@ -114,10 +121,11 @@ fn main() -> anyhow::Result<()> {
         notification.wait(esp_idf_svc::hal::delay::BLOCK);
         button.disable_interrupt()?;       // disarm
 
+        led.set_pixel(RGB8::new(0, 32, 0))?;
         println!(".");
-
         // FreeRtos::delay_ms(60000);
         FreeRtos::delay_ms(1000);
+        led.set_pixel(RGB8::new(32, 0, 0))?;
     }
 
     pub fn enable_nat(ap_netif_handle: &EspNetif) -> anyhow::Result<()> {

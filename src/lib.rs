@@ -1,51 +1,49 @@
-// #![no_std]
-//
-// use esp_hal_smartled::{smartLedBuffer, SmartLedsAdapter};
-// use smart_leds::{hsv::{Hsv, hsv2rgb}, brightness, gamma, SmartLedsWrite};
-// use esp_hal::rmt::{TxChannel, TxChannelCreator};
-// use esp_hal::gpio::OutputPin;
-// use esp_hal::peripheral::Peripheral;
-//
-// /// Single‐LED WS2812 driver that steps its hue on each call.
-// pub struct Led<TX>
-// where
-//     TX: TxChannel,
-// {
-//     adapter: SmartLedsAdapter<TX, { smartLedBuffer!(1).len() }>,
-//     hue: u8,
-// }
-//
-// impl<TX> Led<TX>
-// where
-//     TX: TxChannel,
-// {
-//     /// Create a new WS2812 driver for exactly 1 LED.
-//     ///
-//     /// `channel` is your `rmt.channel0` (a ChannelCreator),
-//     /// `pin` is the GPIO pin (e.g. `per.GPIO8`).
-//     pub fn new<C, O>(channel: C, pin: O) -> Self
-//     where
-//         C: TxChannelCreator<'static, TX, O>,
-//         O: OutputPin + Peripheral<P = O> + 'static,
-//     {
-//         let buffer = smartLedBuffer!(1);
-//         let adapter = SmartLedsAdapter::new(channel, pin, buffer);
-//         Self { adapter, hue: 0 }
-//     }
-//
-//     /// Advance the hue, compute the next RGB value, and write it
-//     /// at `bright/255` brightness.
-//     pub fn random_color(&mut self, bright: u8) -> Result<(), ()> {
-//         let hsv = Hsv {
-//             hue: self.hue,
-//             sat: 255,
-//             val: 255,
-//         };
-//         let rgb = hsv2rgb(hsv);
-//         self.hue = self.hue.wrapping_add(10);
-//
-//         self.adapter
-//             .write(brightness(gamma([rgb].iter().cloned()), bright))
-//             .map_err(|_| ())
-//     }
-// }
+// author: Sergio Gasquez Arcos
+use anyhow::Result;
+use core::time::Duration;
+use esp_idf_hal::{
+    gpio::OutputPin,
+    peripheral::Peripheral,
+    rmt::{config::TransmitConfig, FixedLengthSignal, PinState, Pulse, RmtChannel, TxRmtDriver},
+};
+
+pub use rgb::RGB8;
+
+pub struct WS2812RMT<'a> {
+    tx_rtm_driver: TxRmtDriver<'a>,
+}
+
+impl<'d> WS2812RMT<'d> {
+    // Rust ESP Board gpio2,  ESP32-C3-DevKitC-02 gpio8
+    pub fn new(
+        led: impl Peripheral<P = impl OutputPin> + 'd,
+        channel: impl Peripheral<P = impl RmtChannel> + 'd,
+    ) -> Result<Self> {
+        let config = TransmitConfig::new().clock_divider(2);
+        let tx = TxRmtDriver::new(channel, led, &config)?;
+        Ok(Self { tx_rtm_driver: tx })
+    }
+
+    pub fn set_pixel(&mut self, rgb: RGB8) -> Result<()> {
+        let color: u32 = ((rgb.g as u32) << 16) | ((rgb.r as u32) << 8) | rgb.b as u32;
+        let ticks_hz = self.tx_rtm_driver.counter_clock()?;
+        let t0h = Pulse::new_with_duration(ticks_hz, PinState::High, &ns(350))?;
+        let t0l = Pulse::new_with_duration(ticks_hz, PinState::Low, &ns(800))?;
+        let t1h = Pulse::new_with_duration(ticks_hz, PinState::High, &ns(700))?;
+        let t1l = Pulse::new_with_duration(ticks_hz, PinState::Low, &ns(600))?;
+        let mut signal = FixedLengthSignal::<24>::new();
+        for i in (0..24).rev() {
+            let p = 2_u32.pow(i);
+            let bit = p & color != 0;
+            let (high_pulse, low_pulse) = if bit { (t1h, t1l) } else { (t0h, t0l) };
+            signal.set(23 - i as usize, &(high_pulse, low_pulse))?;
+        }
+        self.tx_rtm_driver.start_blocking(&signal)?;
+
+        Ok(())
+    }
+}
+
+fn ns(nanos: u64) -> Duration {
+    Duration::from_nanos(nanos)
+}
