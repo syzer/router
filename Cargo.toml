@@ -5,6 +5,7 @@ authors = ["Lukasz Gintowt <syzer3@gmail.com>"]
 edition = "2021"
 resolver = "2"
 rust-version = "1.77"
+build = "build.rs"
 
 [[bin]]
 name = "esp-wifi-ap"
@@ -19,7 +20,6 @@ opt-level = "z"
 
 [features]
 default = []
-
 experimental = ["esp-idf-svc/experimental"]
 
 [dependencies]
@@ -28,8 +28,11 @@ esp-idf-svc = { version = "0.51", features = [
     "critical-section",
     "embassy-time-driver",
     "embassy-sync",
-    "experimental"
+    "experimental",
+    "alloc",
 ] }
+esp-idf-sys = { version = "0.36.1", features = ["native", "binstart"] }
+
 anyhow = "1.0.98"
 heapless = "0.8.0"
 embedded-svc = "0.28.1"

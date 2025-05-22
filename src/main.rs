@@ -5,7 +5,10 @@ use esp_idf_svc::nvs::*;
 use heapless::String as HeapString;
 use embedded_svc::wifi::*;
 use esp_idf_svc::*;
-
+use esp_idf_svc::handle::RawHandle;
+use esp_idf_sys as sys;
+use sys::{esp, esp_netif_napt_enable};
+use esp_idf_svc::netif::EspNetif;
 
 const AP_SSID: &str = env!("AP_SSID");
 const AP_PASS: &str = env!("AP_PASS");
@@ -63,11 +66,27 @@ fn main() -> anyhow::Result<()> {
         AP_PASS
     );
 
-    // use esp_idf_svc::netif::EspNetifNat;
-    // let _nat = EspNetifNat::new(wifi.sta_netif(), wifi.ap_netif())?;
-    // info!("NAT enabled: AP clients now reach the Internet");
+    // #[cfg(feature = "experimental")]
+    // {
+    //     let sta = wifi.sta_netif();
+    //     let ap  = wifi.ap_netif();
+    //
+    //     let _nat = EspNetifNat::new(sta, ap)?;
+    //     info!("NAT enabled: AP clients can now reach the Internet");
+    // }
+
+
+    unsafe fn enable_nat(ap: &esp_idf_svc::netif::EspNetif) -> anyhow::Result<()> {
+        esp!(esp_netif_napt_enable(ap.handle()))?;
+        Ok(())
+    }
+
+    let ap  = wifi.ap_netif();
+    unsafe { enable_nat(&ap)?; }
+    info!("NAPT enabled – AP clients have Internet!");
 
     loop {
+        info!(".");
         std::thread::sleep(std::time::Duration::from_secs(60));
     }
 }

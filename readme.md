@@ -1,8 +1,27 @@
+# WAT 
+When you have an ESP but want Router
+Station(Sta) + Access Point(Ap) in mixed mode with NAT 
 # How
 ```bash
 cp .env.example .env
 ```
 
+install ESP_IDF (google it!)
+run `export.bash` or `export.fish` from ESP_IDF
+get tag 5.2.2
+It has to say sth like:
+```bash
+idf.py --version
+ESP-IDF v5.2.3-dirty
+```
+
+## run
+```bash
+cargo install
+just run
+```
+
+## or manually
 ```bash
 cargo build --release --target riscv32imac-esp-espidf
 
