@@ -66,27 +66,19 @@ fn main() -> anyhow::Result<()> {
         AP_PASS
     );
 
-    // #[cfg(feature = "experimental")]
-    // {
-    //     let sta = wifi.sta_netif();
-    //     let ap  = wifi.ap_netif();
-    //
-    //     let _nat = EspNetifNat::new(sta, ap)?;
-    //     info!("NAT enabled: AP clients can now reach the Internet");
-    // }
-
-
-    unsafe fn enable_nat(ap: &esp_idf_svc::netif::EspNetif) -> anyhow::Result<()> {
-        esp!(esp_netif_napt_enable(ap.handle()))?;
-        Ok(())
-    }
-
     let ap  = wifi.ap_netif();
-    unsafe { enable_nat(&ap)?; }
+    enable_nat(&ap)?;
     info!("NAPT enabled – AP clients have Internet!");
 
     loop {
-        info!(".");
+        println!(".");
         std::thread::sleep(std::time::Duration::from_secs(60));
+        // std::thread::sleep(std::time::Duration::from_millis(25));
     }
+
+    pub fn enable_nat(ap: &EspNetif) -> anyhow::Result<()> {
+        unsafe { esp!(esp_netif_napt_enable(ap.handle()))? };
+        Ok(())
+    }
+
 }
