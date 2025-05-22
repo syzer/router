@@ -121,11 +121,12 @@ fn main() -> anyhow::Result<()> {
         notification.wait(esp_idf_svc::hal::delay::BLOCK);
         button.disable_interrupt()?;       // disarm
 
-        led.set_pixel(RGB8::new(0, 32, 0))?;
-        println!(".");
-        // FreeRtos::delay_ms(60000);
-        FreeRtos::delay_ms(1000);
         led.set_pixel(RGB8::new(32, 0, 0))?;
+        println!(".");
+        reconnect_sta(&mut wifi);
+        FreeRtos::delay_ms(10000);
+        led.set_pixel(RGB8::new(0, 32, 0))?;
+
     }
 
     pub fn enable_nat(ap_netif_handle: &EspNetif) -> anyhow::Result<()> {
@@ -140,6 +141,23 @@ fn main() -> anyhow::Result<()> {
                 info!("esp_netif_napt_enable call failed with error code: {}", result);
                 Err(anyhow::anyhow!("Failed to enable NAPT, ESP error code: {}", result))
             }
+        }
+    }
+
+    fn reconnect_sta(wifi: &mut EspWifi<'_>) {
+        let result: anyhow::Result<()> = (|| {
+            wifi.disconnect()?;
+            wifi.stop()?;
+            wifi.start()?;
+            wifi.connect()?;
+            let ap  = wifi.ap_netif();
+            enable_nat(&ap)?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(())  => info!("STA reconnect initiated"),
+            Err(e)  => info!("STA reconnect failed: {:?}", e),
         }
     }
 
