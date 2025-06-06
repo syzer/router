@@ -15,6 +15,11 @@ use esp_idf_svc::hal::{
 use std::num::NonZeroU32;
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_wifi_ap::{WS2812RMT, RGB8};  // RGB8 came from the `rgb` crate
+// use esp_idf_svc::eventloop::EspEvent;
+use esp_idf_svc::wifi::WifiEvent;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+static CLIENT_CONNECTED: AtomicBool = AtomicBool::new(false);
 
 const AP_SSID: &str = env!("AP_SSID");
 const AP_PASS: &str = env!("AP_PASS");
@@ -77,7 +82,7 @@ fn main() -> anyhow::Result<()> {
     let ap_cfg =  AccessPointConfiguration {
         ssid: ap_ssid,
         password: ap_pass,
-        channel: 6,
+        channel: 11, // or 6
         auth_method: AuthMethod::WPA2Personal,
         ..Default::default()
     };
@@ -98,6 +103,15 @@ fn main() -> anyhow::Result<()> {
     wifi.start()?;
     wifi.connect()?;
 
+    // keep subscription alive
+    let _wifi_subscription = sysloop.subscribe::<WifiEvent, _>(move |event: WifiEvent| {
+        println!("Wifi event: {:?}", event);
+        if let WifiEvent::ApStaConnected(_) = event {
+            println!("Client connected, blinking LED");
+            CLIENT_CONNECTED.store(true, Ordering::SeqCst);
+        }
+    })?;
+
     info!("RustyAP up → SSID `{}`  pass `{}`", AP_SSID, AP_PASS);
     info!("Connecting STA to `{}` …", ST_SSID);
 
@@ -112,17 +126,28 @@ fn main() -> anyhow::Result<()> {
     info!("NAPT enabled – AP clients have Internet!");
 
     loop {
+        if CLIENT_CONNECTED.swap(false, Ordering::SeqCst) {
+            for _ in 0..5 {
+                led.set_pixel(RGB8::new(255, 0, 255))?;
+                FreeRtos::delay_ms(200);
+                led.set_pixel(RGB8::new(0, 0, 0))?;
+                FreeRtos::delay_ms(200);
+            }
+        }
         // Arm the interrupt and wait
         button.enable_interrupt()?;
-        notification.wait(esp_idf_svc::hal::delay::BLOCK);
-        button.disable_interrupt()?;       // disarm
-
-        led.set_pixel(RGB8::new(32, 0, 0))?;
-        println!(".");
-        reconnect_sta(&mut wifi);
-        FreeRtos::delay_ms(10000);
-        led.set_pixel(RGB8::new(0, 32, 0))?;
-
+        if notification.wait(50).is_some() {
+            // here maybe spawn second task
+            // Button truly pressed:
+            button.disable_interrupt()?;
+            led.set_pixel(RGB8::new(32, 0, 0))?;
+            reconnect_sta(&mut wifi);
+            FreeRtos::delay_ms(5_000);
+            led.set_pixel(RGB8::new(0, 32, 0))?;
+        } else {
+            // No button press in the last 50 ms, just disable interrupts and loop again
+            button.disable_interrupt()?;
+        }
     }
 
     pub fn enable_nat(ap_netif_handle: &EspNetif) -> anyhow::Result<()> {
