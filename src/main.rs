@@ -3,22 +3,18 @@ use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::wifi::*;
 use esp_idf_svc::nvs::*;
 use heapless::String as HeapString;
-use embedded_svc::wifi::*;
-use esp_idf_svc::*;
 use esp_idf_svc::handle::RawHandle;
 use esp_idf_sys as sys;
-use sys::{esp, esp_netif_napt_enable};
+use sys::esp_netif_napt_enable;
 use esp_idf_svc::netif::EspNetif;
 use esp_idf_svc::hal::{
     gpio::{InterruptType, PinDriver, Pull},
     peripherals::Peripherals,
     task::notification::Notification,
 };
-use smart_leds_trait::SmartLedsWrite;
 use std::num::NonZeroU32;
 use esp_idf_svc::hal::delay::FreeRtos;
-mod lib;
-use lib::{WS2812RMT, RGB8};  // RGB8 came from the `rgb` crate
+use esp_wifi_ap::{WS2812RMT, RGB8};  // RGB8 came from the `rgb` crate
 
 const AP_SSID: &str = env!("AP_SSID");
 const AP_PASS: &str = env!("AP_PASS");
