@@ -1,4 +1,5 @@
 use ::log::info;
+use std::sync::{Arc, Mutex};
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::wifi::*;
 use esp_idf_svc::nvs::*;
@@ -15,9 +16,9 @@ use esp_idf_svc::hal::{
 use std::num::NonZeroU32;
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_wifi_ap::{WS2812RMT, RGB8};  // RGB8 came from the `rgb` crate
-// use esp_idf_svc::eventloop::EspEvent;
 use esp_idf_svc::wifi::WifiEvent;
 use core::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 
 static CLIENT_CONNECTED: AtomicBool = AtomicBool::new(false);
 
@@ -61,10 +62,12 @@ fn main() -> anyhow::Result<()> {
     }
     // button end
 
-    let mut led = WS2812RMT::new(
-        peripherals.pins.gpio8,      // <- ESP32-C6 built-in RGB LED
-        peripherals.rmt.channel0,   // any free TX channel
-    )?;
+    let led = Arc::new(Mutex::new(
+        WS2812RMT::new(
+            peripherals.pins.gpio8,      // ESP32‑C6 built‑in RGB LED
+            peripherals.rmt.channel0,    // any free TX channel
+        )?
+    ));
 
     info!(".....Booting up Wi-Fi AP + STA bridge........");
 
@@ -125,29 +128,62 @@ fn main() -> anyhow::Result<()> {
     enable_nat(&ap)?;
     info!("NAPT enabled – AP clients have Internet!");
 
-    loop {
-        if CLIENT_CONNECTED.swap(false, Ordering::SeqCst) {
-            for _ in 0..5 {
-                led.set_pixel(RGB8::new(255, 0, 255))?;
-                FreeRtos::delay_ms(200);
-                led.set_pixel(RGB8::new(0, 0, 0))?;
-                FreeRtos::delay_ms(200);
+    // Spawn a dedicated task that blinks pink whenever CLIENT_CONNECTED is set
+    let led_task = led.clone();
+    thread::Builder::new()
+        .name("client_blink".into())
+        .stack_size(2048)
+        .spawn(move || {
+            loop {
+                if CLIENT_CONNECTED.swap(false, Ordering::SeqCst) {
+                    let mut led = led_task.lock().unwrap();
+                    for _ in 0..5 {
+                        let _ = led.set_pixel(RGB8::new(0, 0, 0));     // off
+                        FreeRtos::delay_ms(200);
+                        let _ = led.set_pixel(RGB8::new(255, 0, 255)); // pink
+                        FreeRtos::delay_ms(200);
+                    }
+                    let _ = led.set_pixel(RGB8::new(0, 32, 0));
+                } else {
+                    FreeRtos::delay_ms(50);
+                }
             }
-        }
-        // Arm the interrupt and wait
+        })?;
+
+    loop {
         button.enable_interrupt()?;
-        if notification.wait(50).is_some() {
-            // here maybe spawn second task
-            // Button truly pressed:
-            button.disable_interrupt()?;
-            led.set_pixel(RGB8::new(32, 0, 0))?;
-            reconnect_sta(&mut wifi);
-            FreeRtos::delay_ms(5_000);
-            led.set_pixel(RGB8::new(0, 32, 0))?;
-        } else {
-            // No button press in the last 50 ms, just disable interrupts and loop again
-            button.disable_interrupt()?;
+        notification.wait(esp_idf_svc::hal::delay::BLOCK);
+        
+        // Option 1
+        button.disable_interrupt()?;       // disarm
+        {
+            let mut led_guard = led.lock().unwrap();
+            led_guard.set_pixel(RGB8::new(32, 0, 0))?;
         }
+        reconnect_sta(&mut wifi);
+        FreeRtos::delay_ms(5_000);
+        {
+            let mut led_guard = led.lock().unwrap();
+            led_guard.set_pixel(RGB8::new(0, 32, 0))?;
+        }
+        // Option 1 end 
+
+        // Option 2
+        // if notification.wait(50).is_some() {
+        //     button.disable_interrupt()?;
+        //     {
+        //         let mut led_guard = led.lock().unwrap();
+        //         led_guard.set_pixel(RGB8::new(32, 0, 0))?;
+        //     }
+        //     reconnect_sta(&mut wifi);
+        //     FreeRtos::delay_ms(5_000);
+        //     {
+        //         let mut led_guard = led.lock().unwrap();
+        //         led_guard.set_pixel(RGB8::new(0, 32, 0))?;
+        //     }
+        // } else {
+        //     button.disable_interrupt()?;
+        // }
     }
 
     pub fn enable_nat(ap_netif_handle: &EspNetif) -> anyhow::Result<()> {
@@ -181,5 +217,4 @@ fn main() -> anyhow::Result<()> {
             Err(e)  => info!("STA reconnect failed: {:?}", e),
         }
     }
-
 }
