@@ -102,7 +102,7 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    wifi.set_configuration(&Configuration::Mixed(sta_cfg.clone(), ap_cfg))?;
+    wifi.set_configuration(&Configuration::Mixed(sta_cfg.clone(), ap_cfg.clone()))?;
     wifi.start()?;
     wifi.connect()?;
 
@@ -140,10 +140,9 @@ fn main() -> anyhow::Result<()> {
                     for _ in 0..5 {
                         let _ = led.set_pixel(RGB8::new(0, 0, 0));     // off
                         FreeRtos::delay_ms(200);
-                        let _ = led.set_pixel(RGB8::new(255, 0, 255)); // pink
+                        let _ = led.set_pixel(RGB8::new(25, 0, 25)); // pink
                         FreeRtos::delay_ms(200);
                     }
-                    let _ = led.set_pixel(RGB8::new(0, 32, 0));
                 } else {
                     FreeRtos::delay_ms(50);
                 }
@@ -152,69 +151,70 @@ fn main() -> anyhow::Result<()> {
 
     loop {
         button.enable_interrupt()?;
-        notification.wait(esp_idf_svc::hal::delay::BLOCK);
-        
         // Option 1
-        button.disable_interrupt()?;       // disarm
-        {
-            let mut led_guard = led.lock().unwrap();
-            led_guard.set_pixel(RGB8::new(32, 0, 0))?;
-        }
-        reconnect_sta(&mut wifi);
-        FreeRtos::delay_ms(5_000);
-        {
-            let mut led_guard = led.lock().unwrap();
-            led_guard.set_pixel(RGB8::new(0, 32, 0))?;
-        }
+        // notification.wait(esp_idf_svc::hal::delay::BLOCK);        
+        // button.disable_interrupt()?;       // disarm
+        // {
+        //     let mut led_guard = led.lock().unwrap();
+        //     led_guard.set_pixel(RGB8::new(32, 0, 0))?;
+        // }
+        // reconnect_sta(&mut wifi);
+        // FreeRtos::delay_ms(5_000);
+        // {
+        //     let mut led_guard = led.lock().unwrap();
+        //     led_guard.set_pixel(RGB8::new(0, 32, 0))?;
+        // }
         // Option 1 end 
 
+        println!(".");
         // Option 2
-        // if notification.wait(50).is_some() {
-        //     button.disable_interrupt()?;
-        //     {
-        //         let mut led_guard = led.lock().unwrap();
-        //         led_guard.set_pixel(RGB8::new(32, 0, 0))?;
-        //     }
-        //     reconnect_sta(&mut wifi);
-        //     FreeRtos::delay_ms(5_000);
-        //     {
-        //         let mut led_guard = led.lock().unwrap();
-        //         led_guard.set_pixel(RGB8::new(0, 32, 0))?;
-        //     }
-        // } else {
-        //     button.disable_interrupt()?;
-        // }
-    }
-
-    pub fn enable_nat(ap_netif_handle: &EspNetif) -> anyhow::Result<()> {
-        info!("Attempting to enable NAPT on netif handle: {:?}", ap_netif_handle.handle());
-        // Ensure the netif handle is valid and the interface is up.
-        unsafe {
-            let result = esp_netif_napt_enable(ap_netif_handle.handle());
-            if result == sys::ESP_OK {
-                info!("esp_netif_napt_enable call succeeded.");
-                Ok(())
-            } else {
-                info!("esp_netif_napt_enable call failed with error code: {}", result);
-                Err(anyhow::anyhow!("Failed to enable NAPT, ESP error code: {}", result))
+        if notification.wait(50).is_some() {
+            button.disable_interrupt()?;
+            {
+                let mut led_guard = led.lock().unwrap();
+                led_guard.set_pixel(RGB8::new(32, 0, 0))?;
             }
+            reconnect_sta(&mut wifi, &sta_cfg, &ap_cfg);
+
+            FreeRtos::delay_ms(5_000);
+            {
+                let mut led_guard = led.lock().unwrap();
+                led_guard.set_pixel(RGB8::new(0, 32, 0))?;
+            }
+        } else {
+            button.disable_interrupt()?;
         }
     }
 
-    fn reconnect_sta(wifi: &mut EspWifi<'_>) {
-        let result: anyhow::Result<()> = (|| {
-            wifi.disconnect()?;
-            wifi.stop()?;
-            wifi.start()?;
-            wifi.connect()?;
-            let ap  = wifi.ap_netif();
-            enable_nat(&ap)?;
-            Ok(())
-        })();
+}
 
-        match result {
-            Ok(())  => info!("STA reconnect initiated"),
-            Err(e)  => info!("STA reconnect failed: {:?}", e),
+pub fn enable_nat(ap_netif_handle: &EspNetif) -> anyhow::Result<()> {
+    info!("Attempting to enable NAPT on netif handle: {:?}", ap_netif_handle.handle());
+    unsafe {
+        let result = esp_netif_napt_enable(ap_netif_handle.handle());
+        if result == sys::ESP_OK {
+            info!("esp_netif_napt_enable call succeeded.");
+            Ok(())
+        } else {
+            info!("esp_netif_napt_enable call failed with error code: {}", result);
+            Err(anyhow::anyhow!("Failed to enable NAPT, ESP error code: {}", result))
         }
+    }
+}
+fn reconnect_sta(wifi: &mut EspWifi<'_>, sta_cfg: &ClientConfiguration, ap_cfg: &AccessPointConfiguration) {
+    let result: anyhow::Result<()> = (|| {
+        wifi.disconnect()?;
+        wifi.stop()?;
+        wifi.set_configuration(&Configuration::Mixed(sta_cfg.clone(), ap_cfg.clone()))?;
+        wifi.start()?;
+        wifi.connect()?;
+        let ap = wifi.ap_netif();
+        enable_nat(&ap)?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => info!("STA reconnect initiated"),
+        Err(e) => info!("STA reconnect failed: {:?}", e),
     }
 }
