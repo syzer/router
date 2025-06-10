@@ -152,38 +152,37 @@ fn main() -> anyhow::Result<()> {
     loop {
         button.enable_interrupt()?;
         // Option 1
-        // notification.wait(esp_idf_svc::hal::delay::BLOCK);        
-        // button.disable_interrupt()?;       // disarm
-        // {
-        //     let mut led_guard = led.lock().unwrap();
-        //     led_guard.set_pixel(RGB8::new(32, 0, 0))?;
-        // }
-        // reconnect_sta(&mut wifi);
-        // FreeRtos::delay_ms(5_000);
-        // {
-        //     let mut led_guard = led.lock().unwrap();
-        //     led_guard.set_pixel(RGB8::new(0, 32, 0))?;
-        // }
+        notification.wait(esp_idf_svc::hal::delay::BLOCK);
+        button.disable_interrupt()?;       // disarm
+        {
+            let mut led_guard = led.lock().unwrap();
+            led_guard.set_pixel(RGB8::new(32, 0, 0))?;
+        }
+        reconnect_sta(&mut wifi, &sta_cfg, &ap_cfg);
+        FreeRtos::delay_ms(5_000);
+        {
+            let mut led_guard = led.lock().unwrap();
+            led_guard.set_pixel(RGB8::new(0, 32, 0))?;
+        }
         // Option 1 end 
 
-        println!(".");
         // Option 2
-        if notification.wait(50).is_some() {
-            button.disable_interrupt()?;
-            {
-                let mut led_guard = led.lock().unwrap();
-                led_guard.set_pixel(RGB8::new(32, 0, 0))?;
-            }
-            reconnect_sta(&mut wifi, &sta_cfg, &ap_cfg);
-
-            FreeRtos::delay_ms(5_000);
-            {
-                let mut led_guard = led.lock().unwrap();
-                led_guard.set_pixel(RGB8::new(0, 32, 0))?;
-            }
-        } else {
-            button.disable_interrupt()?;
-        }
+        // if notification.wait(50).is_some() {
+        //     button.disable_interrupt()?;
+        //     {
+        //         let mut led_guard = led.lock().unwrap();
+        //         led_guard.set_pixel(RGB8::new(32, 0, 0))?;
+        //     }
+        //     reconnect_sta(&mut wifi, &sta_cfg, &ap_cfg);
+        //
+        //     FreeRtos::delay_ms(5_000);
+        //     {
+        //         let mut led_guard = led.lock().unwrap();
+        //         led_guard.set_pixel(RGB8::new(0, 32, 0))?;
+        //     }
+        // } else {
+        //     button.disable_interrupt()?;
+        // }
     }
 
 }
