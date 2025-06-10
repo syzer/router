@@ -1,5 +1,7 @@
 use ::log::info;
 use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use esp_idf_svc::hal::modem::Modem;
 use esp_idf_svc::wifi::*;
 use esp_idf_svc::nvs::*;
@@ -8,6 +10,7 @@ use esp_idf_svc::handle::RawHandle;
 use esp_idf_sys as sys;
 use sys::esp_netif_napt_enable;
 use esp_idf_svc::netif::EspNetif;
+use esp_idf_svc::netif::IpEvent;
 use esp_idf_svc::hal::{
     gpio::{InterruptType, PinDriver, Pull},
     peripherals::Peripherals,
@@ -16,11 +19,11 @@ use esp_idf_svc::hal::{
 use std::num::NonZeroU32;
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_wifi_ap::{WS2812RMT, RGB8};  // RGB8 came from the `rgb` crate
-use esp_idf_svc::wifi::WifiEvent;
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
-static CLIENT_CONNECTED: AtomicBool = AtomicBool::new(false);
+static CLIENT_GOT_CONNECTED: AtomicBool = AtomicBool::new(false); // for blinking led everytime someone connected
+
 
 const AP_SSID: &str = env!("AP_SSID");
 const AP_PASS: &str = env!("AP_PASS");
@@ -29,6 +32,8 @@ const ST_SSID: &str = env!("ST_SSID");
 const ST_PASS: &str = env!("ST_PASS");
 
 fn main() -> anyhow::Result<()> {
+    let client_ips = Mutex::new(HashMap::<[u8; 6], Ipv4Addr>::new());
+
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
@@ -106,12 +111,21 @@ fn main() -> anyhow::Result<()> {
     wifi.start()?;
     wifi.connect()?;
 
-    // keep subscription alive
-    let _wifi_subscription = sysloop.subscribe::<WifiEvent, _>(move |event: WifiEvent| {
-        println!("Wifi event: {:?}", event);
-        if let WifiEvent::ApStaConnected(_) = event {
-            println!("Client connected, blinking LED");
-            CLIENT_CONNECTED.store(true, Ordering::SeqCst);
+    // Subscribe for IP events so we can see which IP each station gets
+    let _ip_subscription = sysloop.subscribe::<IpEvent, _>(move |event: IpEvent| {
+        if let IpEvent::ApStaIpAssigned(assignment) = event {
+            let mac = assignment.mac();
+            let ip  = assignment.ip();
+
+            println!("Client got IP {} – MAC {}", ip, mac.iter()
+                .map(|byte| format!("{:02x}", byte))
+                .collect::<Vec<String>>()
+                .join(":"));
+
+            if let Ok(mut map) = client_ips.lock() {
+                map.insert(mac, ip);
+            }
+            CLIENT_GOT_CONNECTED.store(true, Ordering::SeqCst);
         }
     })?;
 
@@ -128,14 +142,14 @@ fn main() -> anyhow::Result<()> {
     enable_nat(&ap)?;
     info!("NAPT enabled – AP clients have Internet!");
 
-    // Spawn a dedicated task that blinks pink whenever CLIENT_CONNECTED is set
+    // Spawn a dedicated task that blinks pink whenever CLIENT_GOT_CONNECTED is set
     let led_task = led.clone();
     thread::Builder::new()
         .name("client_blink".into())
         .stack_size(2048)
         .spawn(move || {
             loop {
-                if CLIENT_CONNECTED.swap(false, Ordering::SeqCst) {
+                if CLIENT_GOT_CONNECTED.swap(false, Ordering::SeqCst) {
                     let mut led = led_task.lock().unwrap();
                     for _ in 0..5 {
                         let _ = led.set_pixel(RGB8::new(0, 0, 0));     // off
@@ -151,23 +165,6 @@ fn main() -> anyhow::Result<()> {
 
     loop {
         button.enable_interrupt()?;
-        // Option 1
-        // notification.wait(esp_idf_svc::hal::delay::BLOCK);        
-        // button.disable_interrupt()?;       // disarm
-        // {
-        //     let mut led_guard = led.lock().unwrap();
-        //     led_guard.set_pixel(RGB8::new(32, 0, 0))?;
-        // }
-        // reconnect_sta(&mut wifi);
-        // FreeRtos::delay_ms(5_000);
-        // {
-        //     let mut led_guard = led.lock().unwrap();
-        //     led_guard.set_pixel(RGB8::new(0, 32, 0))?;
-        // }
-        // Option 1 end 
-
-        println!(".");
-        // Option 2
         if notification.wait(50).is_some() {
             button.disable_interrupt()?;
             {
