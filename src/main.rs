@@ -21,8 +21,31 @@ use esp_idf_svc::hal::delay::FreeRtos;
 use esp_wifi_ap::{WS2812RMT, RGB8};  // RGB8 came from the `rgb` crate
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use once_cell::sync::Lazy;
+
+// a global map MAC → human-readable name
+static MAC_NAMES: Lazy<Mutex<HashMap<[u8; 6], String>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+    // Fresh pool of 100 names, regenerated every boot
+static NAME_POOL: Lazy<Mutex<Vec<String>>> = Lazy::new(|| {
+    let mut g = names::Generator::default();
+    let mut v = Vec::with_capacity(100);
+    for _ in 0..100 {
+        v.push(g.next().unwrap());
+    }
+    Mutex::new(v)
+});
+
 
 static CLIENT_GOT_CONNECTED: AtomicBool = AtomicBool::new(false); // for blinking led everytime someone connected
+
+// --- RSSI‑to‑distance calibration constants -------------------------------
+/// RSSI you measure at exactly 1 m from the AP (calibrate for your room!)
+const MEASURED_POWER_DBM: i8 = -45;
+/// Indoor path‑loss exponent (2.0 = open space; ~3.0 = typical office)
+const PATH_LOSS_EXPONENT: f32 = 3.0;
+// --------------------------------------------------------------------------
 
 
 const AP_SSID: &str = env!("AP_SSID");
@@ -121,6 +144,8 @@ fn main() -> anyhow::Result<()> {
                 .map(|byte| format!("{:02x}", byte))
                 .collect::<Vec<String>>()
                 .join(":"));
+            info!("STA {} joined (RSSI will appear in 5\u{202f}s logger)", 
+                  mac.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(":"));
 
             if let Ok(mut map) = client_ips.lock() {
                 map.insert(mac, ip);
@@ -163,6 +188,16 @@ fn main() -> anyhow::Result<()> {
             }
         })?;
 
+    thread::Builder::new()
+        .name("sta_rssi_logger".into())
+        .stack_size(4096)
+        .spawn(|| {
+            loop {
+                log_all_sta_distances();
+                FreeRtos::delay_ms(5_000);
+            }
+        })?;
+
     loop {
         button.enable_interrupt()?;
         if notification.wait(50).is_some() {
@@ -184,6 +219,55 @@ fn main() -> anyhow::Result<()> {
     }
 
 }
+
+/// Log RSSI and distance for every connected station on the Soft‑AP.
+fn log_all_sta_distances() {
+    unsafe {
+        let mut sta_list: sys::wifi_sta_list_t = core::mem::zeroed();
+
+        if sys::esp_wifi_ap_get_sta_list(&mut sta_list as *mut _) != sys::ESP_OK {
+            info!("Failed to fetch STA list for RSSI/dist logging");
+            return;
+        }
+
+        sta_list.sta[0..(sta_list.num as usize)]
+            .iter()
+            .filter(|sta| sta.rssi != 0)  // Filter out entries with no RSSI data
+            .for_each(|sta| {
+                let rssi = sta.rssi as i8;
+                let distance_m = rssi_to_distance(
+                    rssi,
+                    MEASURED_POWER_DBM,
+                    PATH_LOSS_EXPONENT,
+                );
+
+                let mac = sta.mac;
+                let mac_key = mac; // treat it as a key: `[u8; 6]`
+
+                let human_name = {
+                    let mut map = MAC_NAMES.lock().unwrap();
+                    if let Some(name) = map.get(&mac_key) {
+                        name.clone()
+                    } else {
+                        let mut pool = NAME_POOL.lock().unwrap();
+                        let candidate = pool.pop().unwrap_or_else(|| "nameless-device".into());
+                        map.insert(mac_key, candidate.clone());
+                        candidate
+                    }
+                };
+
+                info!(
+                    "📶 RSSI {:>3} dBm → ≈{:.1} m (station {} / {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
+                    rssi,
+                    distance_m,
+                    human_name,
+                    mac[0], mac[1], mac[2],
+                    mac[3], mac[4], mac[5],
+                );
+            });
+    }
+}
+
 
 pub fn enable_nat(ap_netif_handle: &EspNetif) -> anyhow::Result<()> {
     info!("Attempting to enable NAPT on netif handle: {:?}", ap_netif_handle.handle());
@@ -214,4 +298,14 @@ fn reconnect_sta(wifi: &mut EspWifi<'_>, sta_cfg: &ClientConfiguration, ap_cfg: 
         Ok(()) => info!("STA reconnect initiated"),
         Err(e) => info!("STA reconnect failed: {:?}", e),
     }
+}
+
+pub fn rssi_to_distance(
+    rssi_dbm: i8,
+    measured_power_dbm: i8,
+    path_loss_exponent: f32,
+) -> f32 {
+    // delta = how many dB weaker than the 1-metre reference
+    let delta_db = (measured_power_dbm as i16 - rssi_dbm as i16) as f32;
+    10_f32.powf(delta_db / (10.0 * path_loss_exponent))
 }
