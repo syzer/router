@@ -42,7 +42,7 @@ static CLIENT_GOT_CONNECTED: AtomicBool = AtomicBool::new(false); // for blinkin
 
 // --- RSSI‑to‑distance calibration constants -------------------------------
 /// RSSI you measure at exactly 1 m from the AP (calibrate for your room!)
-const MEASURED_POWER_DBM: i8 = -45;
+const MEASURED_POWER_DBM: i8 = -46;
 /// Indoor path‑loss exponent (2.0 = open space; ~3.0 = typical office)
 const PATH_LOSS_EXPONENT: f32 = 3.0;
 // --------------------------------------------------------------------------
@@ -194,7 +194,7 @@ fn main() -> anyhow::Result<()> {
         .spawn(|| {
             loop {
                 log_all_sta_distances();
-                FreeRtos::delay_ms(5_000);
+                FreeRtos::delay_ms(2_000);
             }
         })?;
 
@@ -257,7 +257,7 @@ fn log_all_sta_distances() {
                 };
 
                 info!(
-                    "📶 RSSI {:>3} dBm → ≈{:.1} m (station {} / {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
+                    "📶 RSSI {:>3} dBm → ≈{:.1} m (client {} / {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
                     rssi,
                     distance_m,
                     human_name,
