@@ -1,20 +1,27 @@
 [build]
 target = "riscv32imac-esp-espidf"
 
+# ESP32-C6 target
 [target.riscv32imac-esp-espidf]
 linker = "ldproxy"
-#runner = "espflash flash --monitor"
-#runner = "espflash flash --monitor --port /dev/tty.usbmodem101"
-#runner="espflash flash --port /dev/cu.usbserial-110 --monitor"
-runner="espflash flash --port /dev/cu.usbmodem1101 --monitor"
-#runner="espflash flash --port /dev/cu.usbmodem101 --monitor"
-rustflags = [ "--cfg",  "espidf_time64"]
+# runner = "espflash flash --port /dev/cu.usbmodem101 --monitor"
+runner = "espflash flash --port /dev/cu.usbmodem1101 --monitor"
+
+rustflags = [ "--cfg", "espidf_time64"]
+
+
+
+# ESP32-C3 target  
+[target.riscv32imc-esp-espidf]
+linker = "ldproxy"
+runner = "espflash flash --port /dev/cu.usbmodem101 --monitor"
+rustflags = [ "--cfg", "espidf_time64"]
 
 [unstable]
 build-std = ["std", "panic_abort"]
 
 [env]
-MCU="esp32c6"
+MCU="esp32c6" # will be set by command line or feature flags
 # Note: this variable is not used by the pio builder (`cargo build --features pio`)
 ESP_IDF_VERSION = "v5.2.3"
 
