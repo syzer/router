@@ -21,6 +21,9 @@ cargo install
 just run
 ```
 
+cargo run --bin client
+
+
 ## or manually
 ```bash
 cargo build --release --target riscv32imac-esp-espidf
