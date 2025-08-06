@@ -194,7 +194,7 @@ fn main() -> anyhow::Result<()> {
         .spawn(|| {
             loop {
                 log_all_sta_distances();
-                FreeRtos::delay_ms(2_000);
+                FreeRtos::delay_ms(3_000);
             }
         })?;
 
