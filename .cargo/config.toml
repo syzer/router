@@ -6,8 +6,12 @@ linker = "ldproxy"
 #runner = "espflash flash --monitor"
 #runner = "espflash flash --monitor --port /dev/tty.usbmodem101"
 #runner="espflash flash --port /dev/cu.usbserial-110 --monitor"
-runner="espflash flash --port /dev/cu.usbmodem1101 --monitor"
+# runner="espflash flash --port /dev/cu.usbmodem1101 --monitor"
+# runner = "espflash flash --port /dev/cu.usbmodem2101 --monitor"
+# runner="espflash flash --port /dev/tty.usbserial-1110 --monitor"
 #runner="espflash flash --port /dev/cu.usbmodem101 --monitor"
+runner="espflash flash --port /dev/cu.usbserial-10 --monitor"
+
 rustflags = [ "--cfg",  "espidf_time64"]
 
 [unstable]

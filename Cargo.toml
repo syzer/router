@@ -11,6 +11,11 @@ build = "build.rs"
 name = "esp-wifi-ap"
 harness = false # do not use the built in cargo test harness -> resolve rust-analyzer errors
 
+[[bin]]
+name = "esp-wifi-client"
+path = "src/client_main.rs"
+harness = false
+
 [profile.release]
 opt-level = "s"
 
@@ -52,3 +57,4 @@ once_cell = "1.19" # not sure if goot idea WDYT?
 [build-dependencies]
 embuild = "0.33"
 dotenvy = "0.15"
+names = "0.14"
