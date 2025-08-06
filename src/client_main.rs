@@ -6,12 +6,15 @@ fn main() -> anyhow::Result<()> {
     // Initialize logger
     EspLogger::initialize_default();
 
-    info!("Starting ESP32 Wi-Fi Station Client");
+    info!("Starting ESP32 Wi-Fi Station Client with Network Cycling");
 
-    // Test RSSI calculations first
+    // Show available networks
+    client::show_available_networks();
+
+    // Test RSSI calculations
     client::test_rssi_calculations();
 
-    // Run the main client loop
+    // Run the main client loop with network cycling
     client::run_wifi_client()?;
 
     Ok(())

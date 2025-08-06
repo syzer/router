@@ -1,4 +1,4 @@
-use ::log::info;
+use log::{info, warn};
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -18,16 +18,18 @@ use esp_idf_svc::hal::{
 };
 use std::num::NonZeroU32;
 use esp_idf_svc::hal::delay::FreeRtos;
-use esp_wifi_ap::{WS2812RMT, RGB8};  // RGB8 came from the `rgb` crate
-use core::sync::atomic::{AtomicBool, Ordering};
+use esp_wifi_ap::{WS2812RMT, RGB8};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use once_cell::sync::Lazy;
+
+include!(concat!(env!("OUT_DIR"), "/wifi_networks.rs"));
 
 // a global map MAC → human-readable name
 static MAC_NAMES: Lazy<Mutex<HashMap<[u8; 6], String>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
-    // Fresh pool of 100 names, regenerated every boot
+// Fresh pool of 100 names, regenerated every boot
 static NAME_POOL: Lazy<Mutex<Vec<String>>> = Lazy::new(|| {
     let mut g = names::Generator::default();
     let mut v = Vec::with_capacity(100);
@@ -37,22 +39,55 @@ static NAME_POOL: Lazy<Mutex<Vec<String>>> = Lazy::new(|| {
     Mutex::new(v)
 });
 
-
 static CLIENT_GOT_CONNECTED: AtomicBool = AtomicBool::new(false); // for blinking led everytime someone connected
 
+// Current Wi-Fi network index for STA mode (shared state)
+static CURRENT_NETWORK_INDEX: AtomicUsize = AtomicUsize::new(0);
+
 // --- RSSI‑to‑distance calibration constants -------------------------------
-/// RSSI you measure at exactly 1 m from the AP (calibrate for your room!)
+/// RSSI you measure at exactly 1 m from the AP (calibrate for your room!)
 const MEASURED_POWER_DBM: i8 = -46;
-/// Indoor path‑loss exponent (2.0 = open space; ~3.0 = typical office)
+/// Indoor path‑loss exponent (2.0 = open space; ~3.0 = typical office)
 const PATH_LOSS_EXPONENT: f32 = 3.0;
 // --------------------------------------------------------------------------
-
 
 const AP_SSID: &str = env!("AP_SSID");
 const AP_PASS: &str = env!("AP_PASS");
 
-const ST_SSID: &str = env!("ST_SSID");
-const ST_PASS: &str = env!("ST_PASS");
+/// Get current Wi-Fi network for STA mode
+fn get_current_sta_network() -> Option<&'static WifiCredentials> {
+    let index = CURRENT_NETWORK_INDEX.load(Ordering::SeqCst);
+    get_network(index)
+}
+
+/// Cycle to next Wi-Fi network for STA mode
+fn switch_to_next_sta_network() -> Option<&'static WifiCredentials> {
+    let current_index = CURRENT_NETWORK_INDEX.load(Ordering::SeqCst);
+    let next_index = cycle_to_next_network(current_index);
+    CURRENT_NETWORK_INDEX.store(next_index, Ordering::SeqCst);
+    info!("Switched STA to network index: {} -> {}", current_index, next_index);
+    get_network(next_index)
+}
+
+/// Create STA configuration from current network
+fn create_sta_config() -> anyhow::Result<ClientConfiguration> {
+    let network = get_current_sta_network()
+        .ok_or_else(|| anyhow::anyhow!("No Wi-Fi networks configured for STA mode"))?;
+    
+    info!("Using network cycling STA config: {}", network.ssid);
+    
+    let mut ssid: HeapString<32> = HeapString::<32>::new();
+    ssid.push_str(network.ssid).map_err(|_| anyhow::anyhow!("SSID too long"))?;
+
+    let mut password: HeapString<64> = HeapString::<64>::new();
+    password.push_str(network.password).map_err(|_| anyhow::anyhow!("Password too long"))?;
+
+    Ok(ClientConfiguration {
+        ssid,
+        password,
+        ..Default::default()
+    })
+}
 
 fn main() -> anyhow::Result<()> {
     let client_ips = Mutex::new(HashMap::<[u8; 6], Ipv4Addr>::new());
@@ -99,6 +134,19 @@ fn main() -> anyhow::Result<()> {
 
     info!(".....Booting up Wi-Fi AP + STA bridge........");
 
+    // Check available networks for STA mode
+    let network_count = get_network_count();
+    if network_count == 0 {
+        warn!("No Wi-Fi networks configured for STA mode!");
+    } else {
+        info!("Found {} Wi-Fi networks configured for STA cycling", network_count);
+        for i in 0..network_count {
+            if let Some(network) = get_network(i) {
+                info!("  STA Network {}: {}", i + 1, network.ssid);
+            }
+        }
+    }
+
     let modem   = unsafe { Modem::new() };
     let sysloop = esp_idf_svc::eventloop::EspSystemEventLoop::take()?;
     let nvs     = EspDefaultNvsPartition::take()?;
@@ -118,17 +166,8 @@ fn main() -> anyhow::Result<()> {
         ..Default::default()
     };
 
-    let mut st_ssid: HeapString<32> = HeapString::<32>::new();
-    st_ssid.push_str(ST_SSID).expect("st_ssid too long");
-
-    let mut st_pass: HeapString<64> = HeapString::<64>::new();
-    st_pass.push_str(ST_PASS).expect("st_pass Password too long");
-
-    let sta_cfg = ClientConfiguration {
-        ssid: st_ssid,
-        password: st_pass,
-        ..Default::default()
-    };
+    // Create initial STA configuration from current network
+    let sta_cfg = create_sta_config()?;
 
     wifi.set_configuration(&Configuration::Mixed(sta_cfg.clone(), ap_cfg.clone()))?;
     wifi.start()?;
@@ -155,7 +194,12 @@ fn main() -> anyhow::Result<()> {
     })?;
 
     info!("RustyAP up → SSID `{}`  pass `{}`", AP_SSID, AP_PASS);
-    info!("Connecting STA to `{}` …", ST_SSID);
+    
+    if let Some(network) = get_current_sta_network() {
+        info!("Connecting STA to `{}` …", network.ssid);
+    } else {
+        info!("No STA networks configured for cycling");
+    }
 
     info!(
         "Access point started! SSID: {}, password: {}",
@@ -206,7 +250,21 @@ fn main() -> anyhow::Result<()> {
                 let mut led_guard = led.lock().unwrap();
                 led_guard.set_pixel(RGB8::new(32, 0, 0))?;
             }
-            reconnect_sta(&mut wifi, &sta_cfg, &ap_cfg);
+            
+            // Switch to next network and reconnect
+            switch_to_next_sta_network();
+            if let Some(current_network) = get_current_sta_network() {
+                info!("🔄 Button pressed - switching STA to network: {}", current_network.ssid);
+            }
+            
+            match create_sta_config() {
+                Ok(new_sta_cfg) => {
+                    reconnect_sta(&mut wifi, &new_sta_cfg, &ap_cfg);
+                }
+                Err(e) => {
+                    info!("Failed to create STA config: {:?}", e);
+                }
+            }
 
             FreeRtos::delay_ms(5_000);
             {
@@ -268,7 +326,6 @@ fn log_all_sta_distances() {
     }
 }
 
-
 pub fn enable_nat(ap_netif_handle: &EspNetif) -> anyhow::Result<()> {
     info!("Attempting to enable NAPT on netif handle: {:?}", ap_netif_handle.handle());
     unsafe {
@@ -282,6 +339,7 @@ pub fn enable_nat(ap_netif_handle: &EspNetif) -> anyhow::Result<()> {
         }
     }
 }
+
 fn reconnect_sta(wifi: &mut EspWifi<'_>, sta_cfg: &ClientConfiguration, ap_cfg: &AccessPointConfiguration) {
     let result: anyhow::Result<()> = (|| {
         wifi.disconnect()?;

@@ -14,6 +14,8 @@ This project provides two binaries:
   - Client: RSSI-based distance estimation
 - **Chip Support**: ESP32-C6 and ESP32-C3
 - **Robust Logging**: Comprehensive Wi-Fi event and connection status logging
+- **Network Cycling**: Client can cycle through multiple Wi-Fi networks with button press
+- **Auto-reconnection**: Automatic reconnection handling when networks become unavailable
 
 # How
 ```bash
@@ -58,11 +60,34 @@ Make sure to set up your `.env` file:
 ```bash
 cp .env.example .env
 # Edit .env with your Wi-Fi credentials:
-# ST_SSID=YourWiFiNetwork
-# ST_PASS=YourWiFiPassword  
-# AP_SSID=rust-was-here
-# AP_PASS=change-me-for-your-own
+
+# Access Point settings
+AP_SSID=rust-was-here
+AP_PASS=change-me-for-your-own
+
+# Multiple Wi-Fi networks for client cycling
+ST_SSID_1=HomeWifi
+ST_PASS_1=homepassword123
+
+ST_SSID_2=WorkWifi
+ST_PASS_2=workpassword456
+
+ST_SSID_3=GuestWifi
+ST_PASS_3=guestpassword789
 ```
+
+## Network Cycling (Client Mode)
+The client supports cycling through multiple Wi-Fi networks:
+
+1. **Configure multiple networks** in your `.env` file using the format `ST_SSID_X` and `ST_PASS_X`
+2. **Press GPIO0 button** (boot button) to cycle to the next network
+3. **Automatic wrap-around**: After the last network, it cycles back to the first
+4. **Real-time feedback**: Shows which network is currently selected and connection status
+5. **Auto-reconnection**: Attempts to reconnect if connection is lost
+
+### Button Controls
+- **GPIO0 (Boot Button)**: Cycle to next Wi-Fi network
+- **Hold button**: Immediate network switching (disconnects current, connects to next)
 
 ## RSSI Distance Estimation
 The client uses RSSI (Received Signal Strength Indicator) to estimate distance to the AP:
