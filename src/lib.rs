@@ -9,6 +9,9 @@ use esp_idf_hal::{
 
 pub use rgb::RGB8;
 
+// Export client module for Wi-Fi station functionality
+pub mod client;
+
 pub struct WS2812RMT<'a> {
     tx_rtm_driver: TxRmtDriver<'a>,
 }

@@ -15,3 +15,9 @@ run *args:
 
 where_my_esp_at:
   ls -lt /dev/tty.usb* /dev/cu.usb* 2>/dev/null  | awk '{print $NF}'
+
+build:
+  cargo build --release --target riscv32imac-esp-espidf
+
+flash:
+  espflash flash --monitor --chip esp32c6 target/riscv32imac-esp-espidf/release/esp-wifi-ap
