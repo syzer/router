@@ -22,19 +22,22 @@ This project provides two binaries:
 cp .env.example .env
 ```
 
-install ESP_IDF (google it!)
+Install ESP_IDF (google it!)
 run `export.bash` or `export.fish` from ESP_IDF
-get tag 5.2.2
+get tag 5.2.2 or v5.4
 It has to say sth like:
 ```bash
 idf.py --version
-ESP-IDF v5.2.3-dirty
+ESP-IDF v5.2.3
 ```
 
 ## run
 
 ### Wi-Fi Access Point
 ```bash
+just build
+just flash
+or 
 cargo build --bin esp-wifi-ap
 cargo espflash flash --release --bin esp-wifi-ap
 # OR using tasks
