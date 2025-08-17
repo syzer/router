@@ -1,7 +1,12 @@
 [build]
-target = "riscv32imc-esp-espidf"
+target = "riscv32imac-esp-espidf"
 
-[target.riscv32imc-esp-espidf]
+[target.riscv32imac-esp-espidf] # Esp32-C6
+linker = "ldproxy"
+runner = "espflash flash --monitor"
+rustflags = [ "--cfg",  "espidf_time64"]
+
+[target.riscv32imc-esp-espidf] # Esp32-C3
 linker = "ldproxy"
 runner = "espflash flash --monitor"
 
@@ -11,7 +16,6 @@ rustflags = [ "--cfg",  "espidf_time64"]
 build-std = ["std", "panic_abort"]
 
 [env]
-MCU="esp32c3"
+# overwritten by build scripts
+MCU="esp32c6"
 # Note: this variable is not used by the pio builder (`cargo build --features pio`)
-ESP_IDF_VERSION = "v5.2.3"
-

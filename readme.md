@@ -12,12 +12,36 @@ This project provides two binaries:
 - **Distance Measurement**: 
   - AP: RTT (Round Trip Time) for precise ranging
   - Client: RSSI-based distance estimation
-- **Chip Support**: ESP32-C6 and ESP32-C3
+- **Chip Support**: ESP32-C6 (default) and ESP32-C3
 - **Robust Logging**: Comprehensive Wi-Fi event and connection status logging
 - **Network Cycling**: Client can cycle through multiple Wi-Fi networks with button press
 - **Auto-reconnection**: Automatic reconnection handling when networks become unavailable
 
-# How
+## Hardware Support
+
+### ESP32-C6 (Default)
+- **Target**: `riscv32imac-esp-espidf`
+- **Chip**: esp32c6
+- **Default configuration** - no additional flags needed
+
+### ESP32-C3 (Optional Feature)
+- **Target**: `riscv32imc-esp-espidf` 
+- **Chip**: esp32c3
+- **Feature flag**: `--features esp32c3`
+- **Architecture**: RISC-V 32-bit single-core @ 160 MHz
+- **Memory**: 400 KB SRAM, 384 KB ROM
+
+### Key Differences
+| Feature | ESP32-C6 | ESP32-C3 |
+|---------|----------|----------|
+| Architecture | RISC-V 32-bit dual-core | RISC-V 32-bit single-core |
+| CPU Speed | 160 MHz | 160 MHz |
+| Target | `riscv32imac-esp-espidf` | `riscv32imc-esp-espidf` |
+| Wi-Fi | 802.11 b/g/n | 802.11 b/g/n |
+| Bluetooth | LE 5.0 + Zigbee/Thread | LE 5.0 |
+| Build Command | `just build` | `just build-c3` |
+
+# Setup
 ```bash
 cp .env.example .env
 ```
@@ -31,31 +55,61 @@ idf.py --version
 ESP-IDF v5.2.3
 ```
 
-## run
+## Build & Flash
 
-### Wi-Fi Access Point
+### Wi-Fi Access Point (C6)
 ```bash
-just build
-just flash
-or 
-cargo build --bin esp-wifi-ap
-cargo espflash flash --release --bin esp-wifi-ap
-# OR using tasks
-cargo run --bin esp-wifi-ap
+# Using justfile (recommended)
+just build        # Build for ESP32-C6
+just flash        # Flash to ESP32-C6
+just run          # Build, flash, and monitor
+
+# Or using cargo directly
+cargo build --release --target riscv32imac-esp-espidf
+espflash flash --monitor --chip esp32c6 target/riscv32imac-esp-espidf/release/esp-wifi-ap
+```
+
+### Wi-Fi Access Point (C3)
+```bash
+# Using justfile (recommended)
+just build-c3     # Build for ESP32-C3
+just flash-c3     # Flash to ESP32-C3  
+just run-c3       # Build, flash, and monitor ESP32-C3
+
+# Or using cargo directly
+MCU=esp32c3 cargo build --release --target riscv32imc-esp-espidf --features esp32c3
+espflash flash --monitor --chip esp32c3 target/riscv32imc-esp-espidf/release/esp-wifi-ap
 ```
 
 ### Wi-Fi Station Client  
 ```bash
-cargo build --bin esp-wifi-client
+# ESP32-C6 (default)
+cargo build --bin esp-wifi-client --release
 cargo espflash flash --release --bin esp-wifi-client
+
+# ESP32-C3 
+MCU=esp32c3 cargo build --bin esp-wifi-client --release --target riscv32imc-esp-espidf --features esp32c3
+espflash flash --monitor --chip esp32c3 target/riscv32imc-esp-espidf/release/esp-wifi-client
 # OR using tasks  
 cargo run --bin esp-wifi-client
 ```
 
-### Using justfile
+### Available Just Commands
 ```bash
-cargo install
-just run  # Runs the AP by default
+# ESP32-C6 (Default)
+just build          # Build for ESP32-C6
+just flash          # Flash ESP32-C6
+just run            # Build, flash, and monitor ESP32-C6 (AP mode)
+just run-client     # Build, flash, and monitor ESP32-C6 (Client mode)
+
+# ESP32-C3 (Feature)  
+just build-c3       # Build for ESP32-C3
+just flash-c3       # Flash ESP32-C3
+just run-c3         # Build, flash, and monitor ESP32-C3 (AP mode)
+just run-client-c3  # Build, flash, and monitor ESP32-C3 (Client mode)
+
+# Utility commands
+just where_my_esp_at    # Find ESP device ports
 ```
 
 ## Environment Variables
