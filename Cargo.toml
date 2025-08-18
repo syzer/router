@@ -25,6 +25,7 @@ opt-level = "z"
 
 [features]
 default = []
+esp32c3 = []
 #experimental = ["esp-idf-svc/experimental"]
 
 [dependencies]
