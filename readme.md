@@ -48,11 +48,11 @@ cp .env.example .env
 
 Install ESP_IDF (google it!)
 run `export.bash` or `export.fish` from ESP_IDF
-get tag 5.2.2 or v5.4
+get tag  v5.4.1
 It has to say sth like:
 ```bash
 idf.py --version
-ESP-IDF v5.2.3
+ESP-IDF v5.4.1
 ```
 
 ## Build & Flash

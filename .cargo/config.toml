@@ -18,4 +18,4 @@ build-std = ["std", "panic_abort"]
 [env]
 # overwritten by build scripts
 MCU="esp32c6"
-# Note: this variable is not used by the pio builder (`cargo build --features pio`)
+ESP_IDF_VERSION = "v5.4.1"
