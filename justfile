@@ -1,4 +1,4 @@
-# Justfile ── run `just run` or `just run -- --release`
+# Justfile ── run `just run`, `just run -- --release`, or `just release`
 
 # Regex that strips ANSI colour codes
 COLOR_RE := '\x1B\[([0-9]{1,3}(;[0-9]{1,3})*)?[mGK]'
@@ -24,6 +24,12 @@ run *args:
       | sed -r 's/${COLOR_RE}//g' \
       | pbcopy
 
+# Release (ESP32-C6)
+release *args:
+    # Show coloured output in the terminal,
+    # copy a colour-stripped log to the clipboard
+    cargo run --release --bin esp-wifi-ap {{args}}
+
 # Run with ESP32-C3 
 run-c3 *args:
     # Show coloured output in the terminal,
@@ -32,6 +38,12 @@ run-c3 *args:
       | tee /dev/tty \
       | sed -r 's/${COLOR_RE}//g' \
       | pbcopy
+
+# Release with ESP32-C3 
+release-c3 *args:
+    # Show coloured output in the terminal,
+    # copy a colour-stripped log to the clipboard
+    env MCU=esp32c3 cargo run --release --bin esp-wifi-ap --target riscv32imc-esp-espidf --features esp32c3 {{args}}
 
 # Run client (ESP32-C6)
 run-client *args:
