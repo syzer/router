@@ -18,6 +18,11 @@ harness = false
 
 [profile.release]
 opt-level = "s"
+codegen-units = 1
+lto = "thin"            # or keep "fat" if you measured it helps
+panic = "abort"
+debug = 2               # set to 0 if you want smallest binary
+strip = "debuginfo"     # keep symbols locally, strip on target
 
 [profile.dev]
 debug = true    # Symbols are nice and they don't increase the size on Flash
