@@ -12,6 +12,13 @@ pub use rgb::RGB8;
 // Export client module for Wi-Fi station functionality
 pub mod client;
 
+// Export DNS server functionality
+pub mod dns_server;
+pub mod dns_utils;
+pub mod mac_hostname_config;
+pub mod mac_hostname_demo;
+pub mod mdns_service;
+
 pub struct WS2812RMT<'a> {
     tx_rtm_driver: TxRmtDriver<'a>,
 }
