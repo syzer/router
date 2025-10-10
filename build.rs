@@ -153,6 +153,17 @@ struct StaticLeaseConfig {
     ip: Ipv4Addr,
 }
 
+fn format_mac(mac: &[u8; 6]) -> String {
+    let mut formatted = String::with_capacity(17);
+    for (idx, byte) in mac.iter().enumerate() {
+        if idx > 0 {
+            formatted.push(':');
+        }
+        formatted.push_str(&format!("{:02X}", byte));
+    }
+    formatted
+}
+
 fn collect_static_leases() -> Vec<StaticLeaseConfig> {
     let mut leases = Vec::new();
     let mut seen_macs = HashSet::new();
@@ -168,15 +179,16 @@ fn collect_static_leases() -> Vec<StaticLeaseConfig> {
 
         let mac = parse_mac(raw_mac).unwrap_or_else(|err| {
             panic!(
-                "Invalid MAC identifier `{}` in environment variable `{}`: {}",
+                "Invalid MAC identifier `{}` in environment variable `{}`: {}. Expected formats include AA:BB:CC:DD:EE:FF or aa-bb-cc-dd-ee-ff",
                 raw_mac, key, err
             )
         });
 
         if !seen_macs.insert(mac) {
             panic!(
-                "Duplicate static DHCP reservation for MAC {:02X?}; variable `{}`",
-                mac, key
+                "Duplicate static DHCP reservation for MAC {}; variable `{}`",
+                format_mac(&mac),
+                key
             );
         }
 
