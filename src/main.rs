@@ -1,33 +1,268 @@
-use log::{info, warn};
-use std::sync::{Arc, Mutex};
-use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use core::ffi::c_void;
+use core::fmt::Write as FmtWrite;
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::modem::Modem;
-use esp_idf_svc::wifi::*;
-use esp_idf_svc::nvs::*;
-use heapless::String as HeapString;
-use esp_idf_svc::handle::RawHandle;
-use esp_idf_sys as sys;
-use sys::esp_netif_napt_enable;
-use esp_idf_svc::netif::EspNetif;
-use esp_idf_svc::netif::IpEvent;
 use esp_idf_svc::hal::{
     gpio::{InterruptType, PinDriver, Pull},
     peripherals::Peripherals,
     task::notification::Notification,
 };
-use std::num::NonZeroU32;
-use esp_idf_svc::hal::delay::FreeRtos;
-use esp_wifi_ap::{WS2812RMT, RGB8};
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::thread;
+use esp_idf_svc::handle::RawHandle;
+use esp_idf_svc::netif::EspNetif;
+use esp_idf_svc::netif::IpEvent;
+use esp_idf_svc::nvs::*;
+use esp_idf_svc::wifi::*;
+use esp_idf_sys as sys;
+use esp_idf_sys::ESP_OK;
+use esp_wifi_ap::{RGB8, WS2812RMT};
+use heapless::String as HeapString;
+use log::{info, warn};
 use once_cell::sync::Lazy;
+use std::collections::{HashMap, VecDeque};
+use std::ffi::CStr;
+use std::net::Ipv4Addr;
+use std::num::NonZeroU32;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use sys::esp_netif_napt_enable;
 
 include!(concat!(env!("OUT_DIR"), "/wifi_networks.rs"));
+include!(concat!(env!("OUT_DIR"), "/dhcp_leases.rs"));
+
+static DHCP_RESERVATIONS: Lazy<HashMap<[u8; 6], Ipv4Addr>> = Lazy::new(|| {
+    let mut map = HashMap::new();
+    for lease in STATIC_LEASES {
+        map.insert(
+            lease.mac,
+            Ipv4Addr::new(lease.ip[0], lease.ip[1], lease.ip[2], lease.ip[3]),
+        );
+    }
+    map
+});
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DhcpsLease {
+    enable: bool,
+    start_ip: sys::ip4_addr_t,
+    end_ip: sys::ip4_addr_t,
+}
+
+impl Default for DhcpsLease {
+    fn default() -> Self {
+        Self {
+            enable: false,
+            start_ip: sys::ip4_addr_t { addr: 0 },
+            end_ip: sys::ip4_addr_t { addr: 0 },
+        }
+    }
+}
+
+impl DhcpsLease {
+    fn single_ip(ip: Ipv4Addr) -> Self {
+        let ip4 = ip4_from_ipv4(ip);
+        Self {
+            enable: true,
+            start_ip: ip4,
+            end_ip: ip4,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ActiveOverride {
+    mac: [u8; 6],
+    ip: Ipv4Addr,
+}
+
+struct DhcpReservationManager {
+    handle: *mut sys::esp_netif_t,
+    default: DhcpsLease,
+    queue: VecDeque<[u8; 6]>,
+    active: Option<ActiveOverride>,
+}
+
+unsafe impl Send for DhcpReservationManager {}
+
+impl DhcpReservationManager {
+    fn new(handle: *mut sys::esp_netif_t) -> anyhow::Result<Self> {
+        let default = fetch_current_lease(handle)?;
+        let (start, end) = lease_range(&default);
+        info!("Captured default DHCP pool: {} – {}", start, end,);
+
+        Ok(Self {
+            handle,
+            default,
+            queue: VecDeque::new(),
+            active: None,
+        })
+    }
+
+    fn handle_sta_connected(&mut self, mac: [u8; 6]) -> anyhow::Result<()> {
+        let Some(&ip) = DHCP_RESERVATIONS.get(&mac) else {
+            return Ok(());
+        };
+
+        if self
+            .active
+            .as_ref()
+            .map(|current| current.mac == mac)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+
+        if self.active.is_some() {
+            if !self.queue.iter().any(|queued| queued == &mac) {
+                self.queue.push_back(mac);
+                info!(
+                    "Queued DHCP override for {} (waiting for current reservation to finish)",
+                    format_mac(&mac)
+                );
+            }
+            return Ok(());
+        }
+
+        self.apply_override(mac, ip)
+    }
+
+    fn handle_sta_disconnected(&mut self, mac: [u8; 6]) -> anyhow::Result<()> {
+        self.queue.retain(|queued| queued != &mac);
+
+        if self
+            .active
+            .as_ref()
+            .map(|current| current.mac == mac)
+            .unwrap_or(false)
+        {
+            self.restore_default()?;
+            self.activate_next_in_queue()?;
+        }
+
+        Ok(())
+    }
+
+    fn handle_ip_assigned(&mut self, mac: [u8; 6], ip: Ipv4Addr) -> anyhow::Result<()> {
+        if let Some(active) = self.active {
+            if active.mac == mac {
+                if active.ip != ip {
+                    warn!(
+                        "Reservation mismatch for {}: expected {}, got {}",
+                        format_mac(&mac),
+                        active.ip,
+                        ip
+                    );
+                } else {
+                    info!("Reserved IP {} confirmed for {}", ip, format_mac(&mac));
+                }
+                self.restore_default()?;
+                self.activate_next_in_queue()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_override(&mut self, mac: [u8; 6], ip: Ipv4Addr) -> anyhow::Result<()> {
+        let lease = DhcpsLease::single_ip(ip);
+        set_dhcp_lease(self.handle, &lease)?;
+        info!("Temporarily pinning {} to {}", format_mac(&mac), ip);
+        self.active = Some(ActiveOverride { mac, ip });
+        Ok(())
+    }
+
+    fn restore_default(&mut self) -> anyhow::Result<()> {
+        if self.active.is_some() {
+            let (start, end) = lease_range(&self.default);
+            info!("Restoring default DHCP pool {} – {}", start, end);
+            set_dhcp_lease(self.handle, &self.default)?;
+        }
+        self.active = None;
+        Ok(())
+    }
+
+    fn activate_next_in_queue(&mut self) -> anyhow::Result<()> {
+        while let Some(next_mac) = self.queue.pop_front() {
+            if let Some(&ip) = DHCP_RESERVATIONS.get(&next_mac) {
+                self.apply_override(next_mac, ip)?;
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn fetch_current_lease(handle: *mut sys::esp_netif_t) -> anyhow::Result<DhcpsLease> {
+    let mut lease = DhcpsLease::default();
+    let err = unsafe {
+        sys::esp_netif_dhcps_option(
+            handle,
+            sys::esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_GET,
+            sys::esp_netif_dhcp_option_id_t_ESP_NETIF_REQUESTED_IP_ADDRESS,
+            &mut lease as *mut _ as *mut c_void,
+            core::mem::size_of::<DhcpsLease>() as u32,
+        )
+    };
+
+    if err == ESP_OK {
+        Ok(lease)
+    } else {
+        Err(esp_error(err))
+    }
+}
+
+fn set_dhcp_lease(handle: *mut sys::esp_netif_t, lease: &DhcpsLease) -> anyhow::Result<()> {
+    let mut lease_copy = *lease;
+    let err = unsafe {
+        sys::esp_netif_dhcps_option(
+            handle,
+            sys::esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_SET,
+            sys::esp_netif_dhcp_option_id_t_ESP_NETIF_REQUESTED_IP_ADDRESS,
+            &mut lease_copy as *mut _ as *mut c_void,
+            core::mem::size_of::<DhcpsLease>() as u32,
+        )
+    };
+
+    if err == ESP_OK {
+        Ok(())
+    } else {
+        Err(esp_error(err))
+    }
+}
+
+fn lease_range(lease: &DhcpsLease) -> (Ipv4Addr, Ipv4Addr) {
+    (ip4_to_ipv4(lease.start_ip), ip4_to_ipv4(lease.end_ip))
+}
+
+fn ip4_from_ipv4(ip: Ipv4Addr) -> sys::ip4_addr_t {
+    sys::ip4_addr_t {
+        addr: u32::from_be_bytes(ip.octets()),
+    }
+}
+
+fn ip4_to_ipv4(ip: sys::ip4_addr_t) -> Ipv4Addr {
+    Ipv4Addr::from(ip.addr)
+}
+
+fn esp_error(err: i32) -> anyhow::Error {
+    let name = unsafe { CStr::from_ptr(sys::esp_err_to_name(err)) }.to_string_lossy();
+    anyhow::anyhow!("ESP error {err}: {name}")
+}
+
+fn format_mac(mac: &[u8; 6]) -> String {
+    let mut out = String::with_capacity(17);
+    for (idx, byte) in mac.iter().enumerate() {
+        if idx > 0 {
+            out.push(':');
+        }
+        FmtWrite::write_fmt(&mut out, format_args!("{:02X}", byte)).unwrap();
+    }
+    out
+}
 
 // a global map MAC → human-readable name
-static MAC_NAMES: Lazy<Mutex<HashMap<[u8; 6], String>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static MAC_NAMES: Lazy<Mutex<HashMap<[u8; 6], String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 // Fresh pool of 100 names, regenerated every boot
 static NAME_POOL: Lazy<Mutex<Vec<String>>> = Lazy::new(|| {
@@ -65,7 +300,10 @@ fn switch_to_next_sta_network() -> Option<&'static WifiCredentials> {
     let current_index = CURRENT_NETWORK_INDEX.load(Ordering::SeqCst);
     let next_index = cycle_to_next_network(current_index);
     CURRENT_NETWORK_INDEX.store(next_index, Ordering::SeqCst);
-    info!("Switched STA to network index: {} -> {}", current_index, next_index);
+    info!(
+        "Switched STA to network index: {} -> {}",
+        current_index, next_index
+    );
     get_network(next_index)
 }
 
@@ -73,14 +311,17 @@ fn switch_to_next_sta_network() -> Option<&'static WifiCredentials> {
 fn create_sta_config() -> anyhow::Result<ClientConfiguration> {
     let network = get_current_sta_network()
         .ok_or_else(|| anyhow::anyhow!("No Wi-Fi networks configured for STA mode"))?;
-    
+
     info!("Using network cycling STA config: {}", network.ssid);
-    
+
     let mut ssid: HeapString<32> = HeapString::<32>::new();
-    ssid.push_str(network.ssid).map_err(|_| anyhow::anyhow!("SSID too long"))?;
+    ssid.push_str(network.ssid)
+        .map_err(|_| anyhow::anyhow!("SSID too long"))?;
 
     let mut password: HeapString<64> = HeapString::<64>::new();
-    password.push_str(network.password).map_err(|_| anyhow::anyhow!("Password too long"))?;
+    password
+        .push_str(network.password)
+        .map_err(|_| anyhow::anyhow!("Password too long"))?;
 
     Ok(ClientConfiguration {
         ssid,
@@ -90,13 +331,13 @@ fn create_sta_config() -> anyhow::Result<ClientConfiguration> {
 }
 
 fn main() -> anyhow::Result<()> {
-    let client_ips = Mutex::new(HashMap::<[u8; 6], Ipv4Addr>::new());
+    let client_ips = Arc::new(Mutex::new(HashMap::<[u8; 6], Ipv4Addr>::new()));
 
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
     // button start
-    let peripherals = Peripherals::take()?;            // singleton?
+    let peripherals = Peripherals::take()?; // singleton?
 
     // Push-button on GPIO9, pulled high when idle
     let mut button = PinDriver::input(peripherals.pins.gpio9)?;
@@ -110,27 +351,33 @@ fn main() -> anyhow::Result<()> {
     unsafe {
         // SAFETY: the `Notification` outlives the interrupt subscription
         match button.subscribe(move || {
-            if let Some(val) = NonZeroU32::new(1) { // .unwrap() is fine, this is just more explicit
+            if let Some(val) = NonZeroU32::new(1) {
+                // .unwrap() is fine, this is just more explicit
                 notifier.notify_and_yield(val);
             }
         }) {
             Ok(_) => {
-                info!("Successfully subscribed to button interrupt on GPIO {}", button.pin());
+                info!(
+                    "Successfully subscribed to button interrupt on GPIO {}",
+                    button.pin()
+                );
             }
             Err(e) => {
-                info!("Failed to subscribe to button interrupt on GPIO {}: {:?}", button.pin(), e);
+                info!(
+                    "Failed to subscribe to button interrupt on GPIO {}: {:?}",
+                    button.pin(),
+                    e
+                );
                 () // javascript :D
             }
         }
     }
     // button end
 
-    let led = Arc::new(Mutex::new(
-        WS2812RMT::new(
-            peripherals.pins.gpio8,      // ESP32‑C6 built‑in RGB LED
-            peripherals.rmt.channel0,    // any free TX channel
-        )?
-    ));
+    let led = Arc::new(Mutex::new(WS2812RMT::new(
+        peripherals.pins.gpio8,   // ESP32‑C6 built‑in RGB LED
+        peripherals.rmt.channel0, // any free TX channel
+    )?));
 
     info!(".....Booting up Wi-Fi AP + STA bridge........");
 
@@ -139,7 +386,10 @@ fn main() -> anyhow::Result<()> {
     if network_count == 0 {
         warn!("No Wi-Fi networks configured for STA mode!");
     } else {
-        info!("Found {} Wi-Fi networks configured for STA cycling", network_count);
+        info!(
+            "Found {} Wi-Fi networks configured for STA cycling",
+            network_count
+        );
         for i in 0..network_count {
             if let Some(network) = get_network(i) {
                 info!("  STA Network {}: {}", i + 1, network.ssid);
@@ -147,9 +397,9 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let modem   = unsafe { Modem::new() };
+    let modem = unsafe { Modem::new() };
     let sysloop = esp_idf_svc::eventloop::EspSystemEventLoop::take()?;
-    let nvs     = EspDefaultNvsPartition::take()?;
+    let nvs = EspDefaultNvsPartition::take()?;
     let mut wifi = EspWifi::new(modem, sysloop.clone(), Some(nvs))?;
 
     let mut ap_ssid = heapless::String::<32>::new();
@@ -158,7 +408,7 @@ fn main() -> anyhow::Result<()> {
     let mut ap_pass = heapless::String::<64>::new();
     ap_pass.push_str(AP_PASS).expect("Password too long");
 
-    let ap_cfg =  AccessPointConfiguration {
+    let ap_cfg = AccessPointConfiguration {
         ssid: ap_ssid,
         password: ap_pass,
         channel: 11, // or 6
@@ -173,20 +423,95 @@ fn main() -> anyhow::Result<()> {
     wifi.start()?;
     wifi.connect()?;
 
-    // Subscribe for IP events so we can see which IP each station gets
+    let ap = wifi.ap_netif();
+
+    let dhcp_manager = if DHCP_RESERVATIONS.is_empty() {
+        None
+    } else {
+        match DhcpReservationManager::new(ap.handle()) {
+            Ok(manager) => Some(Arc::new(Mutex::new(manager))),
+            Err(err) => {
+                warn!(
+                    "Failed to initialize static DHCP reservations: {:?}. Reservations disabled.",
+                    err
+                );
+                None
+            }
+        }
+    };
+
+    match dhcp_manager.as_ref() {
+        Some(_) => info!(
+            "Static DHCP reservations enabled for {} device(s)",
+            DHCP_RESERVATIONS.len()
+        ),
+        None if DHCP_RESERVATIONS.is_empty() => info!("No static DHCP reservations configured"),
+        None => info!(
+            "Static DHCP reservations currently disabled ({} reservation(s) configured)",
+            DHCP_RESERVATIONS.len()
+        ),
+    }
+
+    let _wifi_subscription = if let Some(manager) = dhcp_manager.as_ref().map(Arc::clone) {
+        Some(
+            sysloop.subscribe::<WifiEvent, _>(move |event: WifiEvent| match event {
+                WifiEvent::ApStaConnected(conn) => {
+                    let mac = conn.mac();
+                    if let Ok(mut guard) = manager.lock() {
+                        if let Err(err) = guard.handle_sta_connected(mac) {
+                            warn!(
+                                "Failed to schedule DHCP reservation for {}: {:?}",
+                                format_mac(&mac),
+                                err
+                            );
+                        }
+                    }
+                }
+                WifiEvent::ApStaDisconnected(disc) => {
+                    let mac = disc.mac();
+                    if let Ok(mut guard) = manager.lock() {
+                        if let Err(err) = guard.handle_sta_disconnected(mac) {
+                            warn!(
+                                "Failed to handle disconnect for {}: {:?}",
+                                format_mac(&mac),
+                                err
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            })?,
+        )
+    } else {
+        None
+    };
+
+    let dhcp_manager_for_ip = dhcp_manager.clone();
+    let client_ips_for_ip = Arc::clone(&client_ips);
     let _ip_subscription = sysloop.subscribe::<IpEvent, _>(move |event: IpEvent| {
         if let IpEvent::ApStaIpAssigned(assignment) = event {
             let mac = assignment.mac();
-            let ip  = assignment.ip();
+            let ip = Ipv4Addr::from(assignment.ip().octets());
+            let mac_str = format_mac(&mac);
 
-            println!("Client got IP {} – MAC {}", ip, mac.iter()
-                .map(|byte| format!("{:02x}", byte))
-                .collect::<Vec<String>>()
-                .join(":"));
-            info!("STA {} joined (RSSI will appear in 5\u{202f}s logger)", 
-                  mac.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(":"));
+            println!("Client got IP {} – MAC {}", ip, mac_str);
+            info!(
+                "STA {} joined (RSSI will appear in 5\u{202f}s logger)",
+                mac_str.to_lowercase()
+            );
 
-            if let Ok(mut map) = client_ips.lock() {
+            if let Some(manager) = dhcp_manager_for_ip.as_ref() {
+                if let Ok(mut guard) = manager.lock() {
+                    if let Err(err) = guard.handle_ip_assigned(mac, ip) {
+                        warn!(
+                            "Failed to finalize DHCP reservation for {}: {:?}",
+                            mac_str, err
+                        );
+                    }
+                }
+            }
+
+            if let Ok(mut map) = client_ips_for_ip.lock() {
                 map.insert(mac, ip);
             }
             CLIENT_GOT_CONNECTED.store(true, Ordering::SeqCst);
@@ -194,7 +519,7 @@ fn main() -> anyhow::Result<()> {
     })?;
 
     info!("RustyAP up → SSID `{}`  pass `{}`", AP_SSID, AP_PASS);
-    
+
     if let Some(network) = get_current_sta_network() {
         info!("Connecting STA to `{}` …", network.ssid);
     } else {
@@ -203,11 +528,9 @@ fn main() -> anyhow::Result<()> {
 
     info!(
         "Access point started! SSID: {}, password: {}",
-        AP_SSID,
-        AP_PASS
+        AP_SSID, AP_PASS
     );
 
-    let ap  = wifi.ap_netif();
     enable_nat(&ap)?;
     info!("NAPT enabled – AP clients have Internet!");
 
@@ -221,7 +544,7 @@ fn main() -> anyhow::Result<()> {
                 if CLIENT_GOT_CONNECTED.swap(false, Ordering::SeqCst) {
                     let mut led = led_task.lock().unwrap();
                     for _ in 0..5 {
-                        let _ = led.set_pixel(RGB8::new(0, 0, 0));     // off
+                        let _ = led.set_pixel(RGB8::new(0, 0, 0)); // off
                         FreeRtos::delay_ms(200);
                         let _ = led.set_pixel(RGB8::new(25, 0, 25)); // pink
                         FreeRtos::delay_ms(200);
@@ -235,11 +558,9 @@ fn main() -> anyhow::Result<()> {
     thread::Builder::new()
         .name("sta_rssi_logger".into())
         .stack_size(4096)
-        .spawn(|| {
-            loop {
-                log_all_sta_distances();
-                FreeRtos::delay_ms(3_000);
-            }
+        .spawn(|| loop {
+            log_all_sta_distances();
+            FreeRtos::delay_ms(3_000);
         })?;
 
     loop {
@@ -250,13 +571,16 @@ fn main() -> anyhow::Result<()> {
                 let mut led_guard = led.lock().unwrap();
                 led_guard.set_pixel(RGB8::new(32, 0, 0))?;
             }
-            
+
             // Switch to next network and reconnect
             switch_to_next_sta_network();
             if let Some(current_network) = get_current_sta_network() {
-                info!("🔄 Button pressed - switching STA to network: {}", current_network.ssid);
+                info!(
+                    "🔄 Button pressed - switching STA to network: {}",
+                    current_network.ssid
+                );
             }
-            
+
             match create_sta_config() {
                 Ok(new_sta_cfg) => {
                     reconnect_sta(&mut wifi, &new_sta_cfg, &ap_cfg);
@@ -275,7 +599,6 @@ fn main() -> anyhow::Result<()> {
             button.disable_interrupt()?;
         }
     }
-
 }
 
 /// Log RSSI and distance for every connected station on the Soft‑AP.
@@ -327,20 +650,33 @@ fn log_all_sta_distances() {
 }
 
 pub fn enable_nat(ap_netif_handle: &EspNetif) -> anyhow::Result<()> {
-    info!("Attempting to enable NAPT on netif handle: {:?}", ap_netif_handle.handle());
+    info!(
+        "Attempting to enable NAPT on netif handle: {:?}",
+        ap_netif_handle.handle()
+    );
     unsafe {
         let result = esp_netif_napt_enable(ap_netif_handle.handle());
         if result == sys::ESP_OK {
             info!("esp_netif_napt_enable call succeeded.");
             Ok(())
         } else {
-            info!("esp_netif_napt_enable call failed with error code: {}", result);
-            Err(anyhow::anyhow!("Failed to enable NAPT, ESP error code: {}", result))
+            info!(
+                "esp_netif_napt_enable call failed with error code: {}",
+                result
+            );
+            Err(anyhow::anyhow!(
+                "Failed to enable NAPT, ESP error code: {}",
+                result
+            ))
         }
     }
 }
 
-fn reconnect_sta(wifi: &mut EspWifi<'_>, sta_cfg: &ClientConfiguration, ap_cfg: &AccessPointConfiguration) {
+fn reconnect_sta(
+    wifi: &mut EspWifi<'_>,
+    sta_cfg: &ClientConfiguration,
+    ap_cfg: &AccessPointConfiguration,
+) {
     let result: anyhow::Result<()> = (|| {
         wifi.disconnect()?;
         wifi.stop()?;
@@ -358,11 +694,7 @@ fn reconnect_sta(wifi: &mut EspWifi<'_>, sta_cfg: &ClientConfiguration, ap_cfg: 
     }
 }
 
-pub fn rssi_to_distance(
-    rssi_dbm: i8,
-    measured_power_dbm: i8,
-    path_loss_exponent: f32,
-) -> f32 {
+pub fn rssi_to_distance(rssi_dbm: i8, measured_power_dbm: i8, path_loss_exponent: f32) -> f32 {
     // delta = how many dB weaker than the 1-metre reference
     let delta_db = (measured_power_dbm as i16 - rssi_dbm as i16) as f32;
     10_f32.powf(delta_db / (10.0 * path_loss_exponent))
