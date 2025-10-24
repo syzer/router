@@ -30,6 +30,9 @@ use sys::esp_netif_napt_enable;
 include!(concat!(env!("OUT_DIR"), "/wifi_networks.rs"));
 include!(concat!(env!("OUT_DIR"), "/dhcp_leases.rs"));
 
+const DYNAMIC_POOL_START: u32 = 2;
+const STATIC_POOL_START: u32 = 100;
+
 static DHCP_RESERVATIONS: Lazy<HashMap<[u8; 6], Ipv4Addr>> = Lazy::new(|| {
     let mut map = HashMap::new();
     for lease in STATIC_LEASES {
@@ -67,33 +70,6 @@ impl DhcpsLease {
             end_ip: ip4_from_ipv4(end),
         }
     }
-
-    fn reservation(ip: Ipv4Addr, default: &DhcpsLease) -> anyhow::Result<Self> {
-        let (default_start, default_end) = lease_range(default);
-        let requested = u32::from(ip);
-        let range_start = u32::from(default_start);
-        let range_end = u32::from(default_end);
-
-        anyhow::ensure!(
-            (range_start..=range_end).contains(&requested),
-            "Reservation IP {} must be inside default DHCP pool {} – {}",
-            ip,
-            default_start,
-            default_end
-        );
-
-        anyhow::ensure!(
-            requested < range_end,
-            "Reservation IP {} is at the end of DHCP pool {} – {}; pick an address below {}",
-            ip,
-            default_start,
-            default_end,
-            default_end
-        );
-
-        let next = Ipv4Addr::from(requested + 1);
-        Ok(Self::from_range(ip, next))
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -107,21 +83,41 @@ struct DhcpReservationManager {
     default: DhcpsLease,
     queue: VecDeque<[u8; 6]>,
     active: Option<ActiveOverride>,
+    network_base: u32,
+    netmask: u32,
+    broadcast: u32,
 }
 
 unsafe impl Send for DhcpReservationManager {}
 
 impl DhcpReservationManager {
     fn new(handle: *mut sys::esp_netif_t) -> anyhow::Result<Self> {
-        let default = fetch_current_lease(handle)?;
-        let (start, end) = lease_range(&default);
+        let ip_info = fetch_ip_info(handle)?;
+        let netmask = u32::from(esp_ip4_to_ipv4(ip_info.netmask));
+        let network_base = u32::from(esp_ip4_to_ipv4(ip_info.ip)) & netmask;
+        let broadcast = network_base | (!netmask);
+
+        anyhow::ensure!(
+            STATIC_POOL_START > DYNAMIC_POOL_START,
+            "Static pool start must exceed dynamic pool start"
+        );
+
+        let dynamic_start = Ipv4Addr::from(network_base + DYNAMIC_POOL_START);
+        let dynamic_end = Ipv4Addr::from(network_base + STATIC_POOL_START.saturating_sub(1));
+        let desired_default = DhcpsLease::from_range(dynamic_start, dynamic_end);
+        set_dhcp_lease(handle, &desired_default)?;
+
+        let (start, end) = lease_range(&desired_default);
         info!("Captured default DHCP pool: {} – {}", start, end,);
 
         Ok(Self {
             handle,
-            default,
+            default: desired_default,
             queue: VecDeque::new(),
             active: None,
+            network_base,
+            netmask,
+            broadcast,
         })
     }
 
@@ -191,11 +187,46 @@ impl DhcpReservationManager {
     }
 
     fn apply_override(&mut self, mac: [u8; 6], ip: Ipv4Addr) -> anyhow::Result<()> {
-        let lease = DhcpsLease::reservation(ip, &self.default)?;
+        let lease = self.make_reservation(ip)?;
         set_dhcp_lease(self.handle, &lease)?;
         info!("Temporarily pinning {} to {}", format_mac(&mac), ip);
         self.active = Some(ActiveOverride { mac, ip });
         Ok(())
+    }
+
+    fn make_reservation(&self, ip: Ipv4Addr) -> anyhow::Result<DhcpsLease> {
+        let ip_u32 = u32::from(ip);
+        anyhow::ensure!(
+            (ip_u32 & self.netmask) == self.network_base,
+            "Reservation IP {} must be within the AP subnet",
+            ip
+        );
+
+        let host_id = ip_u32
+            .checked_sub(self.network_base)
+            .ok_or_else(|| anyhow::anyhow!("Reservation IP {} underflows network base", ip))?;
+
+        anyhow::ensure!(
+            host_id >= STATIC_POOL_START,
+            "Reservation IP {} must be >= {}",
+            ip,
+            Ipv4Addr::from(self.network_base + STATIC_POOL_START)
+        );
+
+        let max_reservable_host = (self
+            .broadcast
+            .checked_sub(self.network_base)
+            .ok_or_else(|| anyhow::anyhow!("Invalid broadcast address calculation"))?)
+        .saturating_sub(2);
+        anyhow::ensure!(
+            host_id <= max_reservable_host,
+            "Reservation IP {} must be <= {}",
+            ip,
+            Ipv4Addr::from(self.network_base + max_reservable_host)
+        );
+
+        let next = Ipv4Addr::from(ip_u32 + 1);
+        Ok(DhcpsLease::from_range(ip, next))
     }
 
     fn restore_default(&mut self) -> anyhow::Result<()> {
@@ -216,25 +247,6 @@ impl DhcpReservationManager {
             }
         }
         Ok(())
-    }
-}
-
-fn fetch_current_lease(handle: *mut sys::esp_netif_t) -> anyhow::Result<DhcpsLease> {
-    let mut lease = DhcpsLease::default();
-    let err = unsafe {
-        sys::esp_netif_dhcps_option(
-            handle,
-            sys::esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_GET,
-            sys::esp_netif_dhcp_option_id_t_ESP_NETIF_REQUESTED_IP_ADDRESS,
-            &mut lease as *mut _ as *mut c_void,
-            core::mem::size_of::<DhcpsLease>() as u32,
-        )
-    };
-
-    if err == ESP_OK {
-        Ok(lease)
-    } else {
-        Err(esp_error(err))
     }
 }
 
@@ -271,6 +283,20 @@ fn lease_range(lease: &DhcpsLease) -> (Ipv4Addr, Ipv4Addr) {
     (ip4_to_ipv4(lease.start_ip), ip4_to_ipv4(lease.end_ip))
 }
 
+fn fetch_ip_info(handle: *mut sys::esp_netif_t) -> anyhow::Result<sys::esp_netif_ip_info_t> {
+    let mut info = sys::esp_netif_ip_info_t {
+        ip: sys::esp_ip4_addr_t { addr: 0 },
+        netmask: sys::esp_ip4_addr_t { addr: 0 },
+        gw: sys::esp_ip4_addr_t { addr: 0 },
+    };
+    let err = unsafe { sys::esp_netif_get_ip_info(handle, &mut info) };
+    if err == ESP_OK {
+        Ok(info)
+    } else {
+        Err(esp_error(err))
+    }
+}
+
 fn ip4_from_ipv4(ip: Ipv4Addr) -> sys::ip4_addr_t {
     let addr = if cfg!(target_endian = "little") {
         u32::from_le_bytes(ip.octets())
@@ -287,6 +313,10 @@ fn ip4_to_ipv4(ip: sys::ip4_addr_t) -> Ipv4Addr {
         ip.addr.to_be_bytes()
     };
     Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3])
+}
+
+fn esp_ip4_to_ipv4(ip: sys::esp_ip4_addr_t) -> Ipv4Addr {
+    ip4_to_ipv4(sys::ip4_addr_t { addr: ip.addr })
 }
 
 fn esp_error(err: i32) -> anyhow::Error {
