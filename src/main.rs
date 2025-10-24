@@ -60,13 +60,39 @@ impl Default for DhcpsLease {
 }
 
 impl DhcpsLease {
-    fn single_ip(ip: Ipv4Addr) -> Self {
-        let ip4 = ip4_from_ipv4(ip);
+    fn from_range(start: Ipv4Addr, end: Ipv4Addr) -> Self {
         Self {
             enable: true,
-            start_ip: ip4,
-            end_ip: ip4,
+            start_ip: ip4_from_ipv4(start),
+            end_ip: ip4_from_ipv4(end),
         }
+    }
+
+    fn reservation(ip: Ipv4Addr, default: &DhcpsLease) -> anyhow::Result<Self> {
+        let (default_start, default_end) = lease_range(default);
+        let requested = u32::from(ip);
+        let range_start = u32::from(default_start);
+        let range_end = u32::from(default_end);
+
+        anyhow::ensure!(
+            (range_start..=range_end).contains(&requested),
+            "Reservation IP {} must be inside default DHCP pool {} – {}",
+            ip,
+            default_start,
+            default_end
+        );
+
+        anyhow::ensure!(
+            requested < range_end,
+            "Reservation IP {} is at the end of DHCP pool {} – {}; pick an address below {}",
+            ip,
+            default_start,
+            default_end,
+            default_end
+        );
+
+        let next = Ipv4Addr::from(requested + 1);
+        Ok(Self::from_range(ip, next))
     }
 }
 
@@ -165,7 +191,7 @@ impl DhcpReservationManager {
     }
 
     fn apply_override(&mut self, mac: [u8; 6], ip: Ipv4Addr) -> anyhow::Result<()> {
-        let lease = DhcpsLease::single_ip(ip);
+        let lease = DhcpsLease::reservation(ip, &self.default)?;
         set_dhcp_lease(self.handle, &lease)?;
         info!("Temporarily pinning {} to {}", format_mac(&mac), ip);
         self.active = Some(ActiveOverride { mac, ip });
@@ -213,8 +239,13 @@ fn fetch_current_lease(handle: *mut sys::esp_netif_t) -> anyhow::Result<DhcpsLea
 }
 
 fn set_dhcp_lease(handle: *mut sys::esp_netif_t, lease: &DhcpsLease) -> anyhow::Result<()> {
+    let stop_err = unsafe { sys::esp_netif_dhcps_stop(handle) };
+    if stop_err != ESP_OK && stop_err != sys::ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED {
+        return Err(esp_error(stop_err));
+    }
+
     let mut lease_copy = *lease;
-    let err = unsafe {
+    let set_err = unsafe {
         sys::esp_netif_dhcps_option(
             handle,
             sys::esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_SET,
@@ -224,10 +255,15 @@ fn set_dhcp_lease(handle: *mut sys::esp_netif_t, lease: &DhcpsLease) -> anyhow::
         )
     };
 
-    if err == ESP_OK {
+    let start_err = unsafe { sys::esp_netif_dhcps_start(handle) };
+    if start_err != ESP_OK && start_err != sys::ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED {
+        return Err(esp_error(start_err));
+    }
+
+    if set_err == ESP_OK {
         Ok(())
     } else {
-        Err(esp_error(err))
+        Err(esp_error(set_err))
     }
 }
 
@@ -236,13 +272,21 @@ fn lease_range(lease: &DhcpsLease) -> (Ipv4Addr, Ipv4Addr) {
 }
 
 fn ip4_from_ipv4(ip: Ipv4Addr) -> sys::ip4_addr_t {
-    sys::ip4_addr_t {
-        addr: u32::from_be_bytes(ip.octets()),
-    }
+    let addr = if cfg!(target_endian = "little") {
+        u32::from_le_bytes(ip.octets())
+    } else {
+        u32::from_be_bytes(ip.octets())
+    };
+    sys::ip4_addr_t { addr }
 }
 
 fn ip4_to_ipv4(ip: sys::ip4_addr_t) -> Ipv4Addr {
-    Ipv4Addr::from(ip.addr)
+    let bytes = if cfg!(target_endian = "little") {
+        ip.addr.to_le_bytes()
+    } else {
+        ip.addr.to_be_bytes()
+    };
+    Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3])
 }
 
 fn esp_error(err: i32) -> anyhow::Error {
