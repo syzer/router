@@ -138,6 +138,7 @@ ST_PASS_3=guestpassword789
 ```
 
 Static leases follow the format `DHCP_<MAC>=<IP>`, where the MAC address is 12 hexadecimal characters without separators (colons/dashes). For example, to reserve `192.168.4.50` for device `AA:BB:CC:DD:EE:FF`, set `DHCP_AABBCCDDEEFF=192.168.4.50` in your `.env`.
+Use addresses above `192.168.4.100` for these static leases to avoid conflicts with dynamic assignments.
 
 ## Network Cycling (Client Mode)
 The client supports cycling through multiple Wi-Fi networks:
