@@ -14,6 +14,7 @@ This project provides two binaries:
   - Client: RSSI-based distance estimation
 - **Chip Support**: ESP32-C6 (default) and ESP32-C3
 - **Robust Logging**: Comprehensive Wi-Fi event and connection status logging
+- **Static DHCP Reservations**: Pin specific client MACs to deterministic IP addresses through `.env`
 - **Network Cycling**: Client can cycle through multiple Wi-Fi networks with button press
 - **Auto-reconnection**: Automatic reconnection handling when networks become unavailable
 
@@ -131,7 +132,12 @@ ST_PASS_2=workpassword456
 
 ST_SSID_3=GuestWifi
 ST_PASS_3=guestpassword789
+
+# Optional static DHCP reservation (MAC without separators)
+# DHCP_AABBCCDDEEFF=192.168.4.50
 ```
+
+Static leases follow the format `DHCP_<MAC>=<IP>`, where the MAC address is 12 hexadecimal characters without separators (colons/dashes). For example, to reserve `192.168.4.50` for device `AA:BB:CC:DD:EE:FF`, set `DHCP_AABBCCDDEEFF=192.168.4.50` in your `.env`.
 
 ## Network Cycling (Client Mode)
 The client supports cycling through multiple Wi-Fi networks:
