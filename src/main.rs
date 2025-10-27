@@ -25,6 +25,7 @@ use std::net::Ipv4Addr;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 use sys::esp_netif_napt_enable;
 
 include!(concat!(env!("OUT_DIR"), "/wifi_networks.rs"));
@@ -349,6 +350,7 @@ static NAME_POOL: Lazy<Mutex<Vec<String>>> = Lazy::new(|| {
 });
 
 static CLIENT_GOT_CONNECTED: AtomicBool = AtomicBool::new(false); // for blinking led everytime someone connected
+static STA_RECONNECT_PENDING: AtomicBool = AtomicBool::new(false);
 
 // Current Wi-Fi network index for STA mode (shared state)
 static CURRENT_NETWORK_INDEX: AtomicUsize = AtomicUsize::new(0);
@@ -526,10 +528,33 @@ fn main() -> anyhow::Result<()> {
         ),
     }
 
-    let _wifi_subscription = if let Some(manager) = dhcp_manager.as_ref().map(Arc::clone) {
-        Some(
-            sysloop.subscribe::<WifiEvent, _>(move |event: WifiEvent| match event {
-                WifiEvent::ApStaConnected(conn) => {
+    let manager_for_wifi = dhcp_manager.as_ref().map(Arc::clone);
+    let _wifi_subscription =
+        sysloop.subscribe::<WifiEvent, _>(move |event: WifiEvent| match event {
+            WifiEvent::StaDisconnected(details) => {
+                let ssid = String::from_utf8_lossy(details.ssid());
+                let reason = details.reason();
+                warn!(
+                    "STA disconnected from `{}` (reason {}) – scheduling reconnect",
+                    ssid, reason
+                );
+                STA_RECONNECT_PENDING.store(true, Ordering::SeqCst);
+            }
+            WifiEvent::StaStopped => {
+                warn!("STA interface stopped – scheduling reconnect");
+                STA_RECONNECT_PENDING.store(true, Ordering::SeqCst);
+            }
+            WifiEvent::StaBeaconTimeout => {
+                warn!("STA beacon timeout – scheduling reconnect");
+                STA_RECONNECT_PENDING.store(true, Ordering::SeqCst);
+            }
+            WifiEvent::StaConnected(details) => {
+                let ssid = String::from_utf8_lossy(details.ssid());
+                info!("STA connected to `{}`", ssid);
+                STA_RECONNECT_PENDING.store(false, Ordering::SeqCst);
+            }
+            WifiEvent::ApStaConnected(conn) => {
+                if let Some(manager) = manager_for_wifi.as_ref() {
                     let mac = conn.mac();
                     if let Ok(mut guard) = manager.lock() {
                         if let Err(err) = guard.handle_sta_connected(mac) {
@@ -541,7 +566,9 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                WifiEvent::ApStaDisconnected(disc) => {
+            }
+            WifiEvent::ApStaDisconnected(disc) => {
+                if let Some(manager) = manager_for_wifi.as_ref() {
                     let mac = disc.mac();
                     if let Ok(mut guard) = manager.lock() {
                         if let Err(err) = guard.handle_sta_disconnected(mac) {
@@ -553,12 +580,9 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                _ => {}
-            })?,
-        )
-    } else {
-        None
-    };
+            }
+            _ => {}
+        })?;
 
     let dhcp_manager_for_ip = dhcp_manager.clone();
     let client_ips_for_ip = Arc::clone(&client_ips);
@@ -637,6 +661,8 @@ fn main() -> anyhow::Result<()> {
             FreeRtos::delay_ms(3_000);
         })?;
 
+    let mut last_sta_reconnect_attempt: Option<Instant> = None;
+
     loop {
         button.enable_interrupt()?;
         if notification.wait(50).is_some() {
@@ -671,6 +697,28 @@ fn main() -> anyhow::Result<()> {
             }
         } else {
             button.disable_interrupt()?;
+        }
+
+        if STA_RECONNECT_PENDING.load(Ordering::SeqCst) {
+            let should_attempt = match last_sta_reconnect_attempt {
+                Some(last) => last.elapsed() >= Duration::from_secs(20),
+                None => true,
+            };
+
+            if should_attempt {
+                info!("STA reconnect timer elapsed – attempting to reconnect");
+                last_sta_reconnect_attempt = Some(Instant::now());
+                match create_sta_config() {
+                    Ok(new_sta_cfg) => {
+                        reconnect_sta(&mut wifi, &new_sta_cfg, &ap_cfg);
+                    }
+                    Err(err) => {
+                        warn!("Unable to prepare STA config for reconnect: {:?}", err);
+                    }
+                }
+            }
+        } else {
+            last_sta_reconnect_attempt = None;
         }
     }
 }
