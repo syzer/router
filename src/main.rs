@@ -20,12 +20,14 @@ use heapless::String as HeapString;
 use log::{info, warn};
 use once_cell::sync::Lazy;
 use std::collections::{HashMap, VecDeque};
+use std::cmp::Ordering as CmpOrdering;
 use std::ffi::CStr;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::ptr;
 use sys::esp_netif_napt_enable;
 
 include!(concat!(env!("OUT_DIR"), "/wifi_networks.rs"));
@@ -411,6 +413,10 @@ fn main() -> anyhow::Result<()> {
 
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    unsafe {
+        // Raise global ESP-IDF log verbosity to DEBUG for richer diagnostics
+        esp_idf_sys::esp_log_level_set(ptr::null(), esp_idf_sys::esp_log_level_t_ESP_LOG_DEBUG);
+    }
 
     // button start
     let peripherals = Peripherals::take()?; // singleton?
@@ -654,12 +660,42 @@ fn main() -> anyhow::Result<()> {
             }
         })?;
 
+    let client_ips_for_rssi = Arc::clone(&client_ips);
     thread::Builder::new()
         .name("sta_rssi_logger".into())
         .stack_size(4096)
-        .spawn(|| loop {
-            log_all_sta_distances();
-            FreeRtos::delay_ms(3_000);
+        .spawn(move || {
+            let mut rssi_stats: HashMap<[u8; 6], (i8, i8)> = HashMap::new();
+            let mut last_table = Instant::now();
+
+            loop {
+                match collect_sta_snapshots(&client_ips_for_rssi) {
+                    Ok(snapshots) => {
+                        for snap in &snapshots {
+                            rssi_stats
+                                .entry(snap.mac)
+                                .and_modify(|entry| {
+                                    entry.0 = entry.0.min(snap.rssi);
+                                    entry.1 = entry.1.max(snap.rssi);
+                                })
+                                .or_insert((snap.rssi, snap.rssi));
+                        }
+
+                        if last_table.elapsed() >= Duration::from_secs(10) {
+                            if let Some(table) = render_sta_table(&snapshots, &rssi_stats) {
+                                info!("\n{}", table);
+                            }
+                            rssi_stats.clear();
+                            last_table = Instant::now();
+                        }
+                    }
+                    Err(err) => {
+                        warn!("Failed to update STA stats: {:?}", err);
+                    }
+                }
+
+                FreeRtos::delay_ms(1_000);
+            }
         })?;
 
     let mut last_sta_reconnect_attempt: Option<Instant> = None;
@@ -724,52 +760,197 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Log RSSI and distance for every connected station on the Soft‑AP.
-fn log_all_sta_distances() {
+struct StaSnapshot {
+    mac: [u8; 6],
+    name: String,
+    rssi: i8,
+    distance: f32,
+    ip: Option<Ipv4Addr>,
+}
+
+fn collect_sta_snapshots(
+    client_ips: &Arc<Mutex<HashMap<[u8; 6], Ipv4Addr>>>,
+) -> anyhow::Result<Vec<StaSnapshot>> {
     unsafe {
         let mut sta_list: sys::wifi_sta_list_t = core::mem::zeroed();
-
         if sys::esp_wifi_ap_get_sta_list(&mut sta_list as *mut _) != sys::ESP_OK {
-            info!("Failed to fetch STA list for RSSI/dist logging");
-            return;
+            anyhow::bail!("Failed to fetch STA list for RSSI/dist logging");
         }
 
-        sta_list.sta[0..(sta_list.num as usize)]
-            .iter()
-            .filter(|sta| sta.rssi != 0)  // Filter out entries with no RSSI data
-            .for_each(|sta| {
-                let rssi = sta.rssi as i8;
-                let distance_m = rssi_to_distance(
-                    rssi,
-                    MEASURED_POWER_DBM,
-                    PATH_LOSS_EXPONENT,
-                );
+        let mut snapshots = Vec::new();
 
-                let mac = sta.mac;
-                let mac_key = mac; // treat it as a key: `[u8; 6]`
+        for sta in sta_list.sta[0..(sta_list.num as usize)].iter().filter(|sta| sta.rssi != 0) {
+            let rssi = sta.rssi as i8;
+            let distance = rssi_to_distance(rssi, MEASURED_POWER_DBM, PATH_LOSS_EXPONENT);
+            let mac = sta.mac;
 
-                let human_name = {
-                    let mut map = MAC_NAMES.lock().unwrap();
-                    if let Some(name) = map.get(&mac_key) {
-                        name.clone()
-                    } else {
-                        let mut pool = NAME_POOL.lock().unwrap();
-                        let candidate = pool.pop().unwrap_or_else(|| "nameless-device".into());
-                        map.insert(mac_key, candidate.clone());
-                        candidate
-                    }
-                };
+            let name = {
+                let mut map = MAC_NAMES.lock().unwrap();
+                if let Some(existing) = map.get(&mac) {
+                    existing.clone()
+                } else {
+                    let mut pool = NAME_POOL.lock().unwrap();
+                    let candidate = pool.pop().unwrap_or_else(|| "nameless-device".into());
+                    map.insert(mac, candidate.clone());
+                    candidate
+                }
+            };
 
-                info!(
-                    "📶 RSSI {:>3} dBm → ≈{:.1} m (client {} / {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
-                    rssi,
-                    distance_m,
-                    human_name,
-                    mac[0], mac[1], mac[2],
-                    mac[3], mac[4], mac[5],
-                );
+            let ip = client_ips
+                .lock()
+                .ok()
+                .and_then(|ips| ips.get(&mac).copied());
+
+            snapshots.push(StaSnapshot {
+                mac,
+                name,
+                rssi,
+                distance,
+                ip,
             });
+        }
+
+        Ok(snapshots)
     }
+}
+
+fn render_sta_table(
+    snapshots: &[StaSnapshot],
+    stats: &HashMap<[u8; 6], (i8, i8)>,
+) -> Option<String> {
+    if snapshots.is_empty() {
+        return None;
+    }
+
+    let mut rows: Vec<(&StaSnapshot, (i8, i8))> = snapshots
+        .iter()
+        .map(|snap| {
+            let (min, max) = stats
+                .get(&snap.mac)
+                .copied()
+                .unwrap_or((snap.rssi, snap.rssi));
+            (snap, (min, max))
+        })
+        .collect();
+
+    rows.sort_by(|(a, _), (b, _)| {
+        a.distance
+            .partial_cmp(&b.distance)
+            .unwrap_or(CmpOrdering::Equal)
+    });
+
+    struct TableRow {
+        name: String,
+        mac: String,
+        rssi_range: String,
+        distance: String,
+        ip: String,
+    }
+
+    let table_rows: Vec<TableRow> = rows
+        .into_iter()
+        .map(|(snap, (min_rssi, max_rssi))| TableRow {
+            name: snap.name.clone(),
+            mac: format_mac(&snap.mac),
+            rssi_range: format!("{min}..{max}", min = min_rssi, max = max_rssi),
+            distance: format!("{:.1}", snap.distance),
+            ip: snap
+                .ip
+                .map(|ip| ip.to_string())
+                .unwrap_or_else(|| "-".into()),
+        })
+        .collect();
+
+    let headers = ["Client", "MAC", "RSSI(dBm)", "Dist(m)", "IP"];
+
+    let client_width = table_rows
+        .iter()
+        .map(|row| row.name.len())
+        .max()
+        .unwrap_or(0)
+        .max(headers[0].len());
+    let mac_width = table_rows
+        .iter()
+        .map(|row| row.mac.len())
+        .max()
+        .unwrap_or(0)
+        .max(headers[1].len());
+    let rssi_width = table_rows
+        .iter()
+        .map(|row| row.rssi_range.len())
+        .max()
+        .unwrap_or(0)
+        .max(headers[2].len());
+    let dist_width = table_rows
+        .iter()
+        .map(|row| row.distance.len())
+        .max()
+        .unwrap_or(0)
+        .max(headers[3].len());
+    let ip_width = table_rows
+        .iter()
+        .map(|row| row.ip.len())
+        .max()
+        .unwrap_or(0)
+        .max(headers[4].len());
+
+    let widths = [client_width, mac_width, rssi_width, dist_width, ip_width];
+
+    fn border(left: char, sep: char, right: char, widths: &[usize]) -> String {
+        let mut line = String::new();
+        line.push(left);
+        for (idx, width) in widths.iter().enumerate() {
+            let segment: String = std::iter::repeat('─').take(*width + 2).collect();
+            line.push_str(&segment);
+            if idx == widths.len() - 1 {
+                line.push(right);
+            } else {
+                line.push(sep);
+            }
+        }
+        line
+    }
+
+    fn format_row(values: &[(String, usize)]) -> String {
+        let mut line = String::new();
+        line.push('│');
+        for (value, width) in values {
+            line.push(' ');
+            line.push_str(&format!("{:<width$}", value, width = *width));
+            line.push(' ');
+            line.push('│');
+        }
+        line
+    }
+
+    let mut table = String::new();
+    table.push_str(&border('┌', '┬', '┐', &widths));
+    table.push('\n');
+    table.push_str(&format_row(&[
+        (headers[0].to_string(), client_width),
+        (headers[1].to_string(), mac_width),
+        (headers[2].to_string(), rssi_width),
+        (headers[3].to_string(), dist_width),
+        (headers[4].to_string(), ip_width),
+    ]));
+    table.push('\n');
+    table.push_str(&border('├', '┼', '┤', &widths));
+
+    for row in table_rows {
+        table.push('\n');
+        table.push_str(&format_row(&[
+            (row.name, client_width),
+            (row.mac, mac_width),
+            (row.rssi_range, rssi_width),
+            (row.distance, dist_width),
+            (row.ip, ip_width),
+        ]));
+    }
+
+    table.push('\n');
+    table.push_str(&border('└', '┴', '┘', &widths));
+
+    Some(table)
 }
 
 pub fn enable_nat(ap_netif_handle: &EspNetif) -> anyhow::Result<()> {
