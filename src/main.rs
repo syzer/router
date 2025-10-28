@@ -489,6 +489,7 @@ fn main() -> anyhow::Result<()> {
         password: ap_pass,
         channel: 11, // or 6
         auth_method: AuthMethod::WPA2Personal,
+        max_connections: 16,
         ..Default::default()
     };
 
