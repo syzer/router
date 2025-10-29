@@ -1,5 +1,4 @@
 use core::ffi::c_void;
-use core::fmt::Write as FmtWrite;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::modem::Modem;
@@ -15,7 +14,7 @@ use esp_idf_svc::nvs::*;
 use esp_idf_svc::wifi::*;
 use esp_idf_sys as sys;
 use esp_idf_sys::ESP_OK;
-use esp_wifi_ap::{RGB8, WS2812RMT};
+use esp_wifi_ap::{format_mac, render_sta_table, RssiDbm, RssiRange, StaSnapshot, RGB8, WS2812RMT};
 use heapless::String as HeapString;
 use log::{info, warn};
 use once_cell::sync::Lazy;
@@ -23,6 +22,7 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::CStr;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU32;
+use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -325,19 +325,10 @@ fn esp_error(err: i32) -> anyhow::Error {
     anyhow::anyhow!("ESP error {err}: {name}")
 }
 
-fn format_mac(mac: &[u8; 6]) -> String {
-    let mut out = String::with_capacity(17);
-    for (idx, byte) in mac.iter().enumerate() {
-        if idx > 0 {
-            out.push(':');
-        }
-        FmtWrite::write_fmt(&mut out, format_args!("{:02X}", byte)).unwrap();
-    }
-    out
-}
-
 // a global map MAC → human-readable name
 static MAC_NAMES: Lazy<Mutex<HashMap<[u8; 6], String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static LAST_KNOWN_IPS: Lazy<Mutex<HashMap<[u8; 6], Ipv4Addr>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 // Fresh pool of 100 names, regenerated every boot
 static NAME_POOL: Lazy<Mutex<Vec<String>>> = Lazy::new(|| {
@@ -411,6 +402,10 @@ fn main() -> anyhow::Result<()> {
 
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    unsafe {
+        // Raise global ESP-IDF log verbosity to DEBUG for richer diagnostics
+        esp_idf_sys::esp_log_level_set(ptr::null(), esp_idf_sys::esp_log_level_t_ESP_LOG_DEBUG);
+    }
 
     // button start
     let peripherals = Peripherals::take()?; // singleton?
@@ -489,6 +484,7 @@ fn main() -> anyhow::Result<()> {
         password: ap_pass,
         channel: 11, // or 6
         auth_method: AuthMethod::WPA2Personal,
+        max_connections: 16,
         ..Default::default()
     };
 
@@ -529,6 +525,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     let manager_for_wifi = dhcp_manager.as_ref().map(Arc::clone);
+    let client_ips_for_wifi = Arc::clone(&client_ips);
+    let led_for_wifi = Arc::clone(&led);
     let _wifi_subscription =
         sysloop.subscribe::<WifiEvent, _>(move |event: WifiEvent| match event {
             WifiEvent::StaDisconnected(details) => {
@@ -539,23 +537,45 @@ fn main() -> anyhow::Result<()> {
                     ssid, reason
                 );
                 STA_RECONNECT_PENDING.store(true, Ordering::SeqCst);
+                if let Ok(mut led) = led_for_wifi.lock() {
+                    let _ = led.set_pixel(RGB8::new(32, 0, 0)); // red indicates reconnecting
+                }
             }
             WifiEvent::StaStopped => {
                 warn!("STA interface stopped – scheduling reconnect");
                 STA_RECONNECT_PENDING.store(true, Ordering::SeqCst);
+                if let Ok(mut led) = led_for_wifi.lock() {
+                    let _ = led.set_pixel(RGB8::new(32, 0, 0));
+                }
             }
             WifiEvent::StaBeaconTimeout => {
                 warn!("STA beacon timeout – scheduling reconnect");
                 STA_RECONNECT_PENDING.store(true, Ordering::SeqCst);
+                if let Ok(mut led) = led_for_wifi.lock() {
+                    let _ = led.set_pixel(RGB8::new(32, 0, 0));
+                }
             }
             WifiEvent::StaConnected(details) => {
                 let ssid = String::from_utf8_lossy(details.ssid());
                 info!("STA connected to `{}`", ssid);
                 STA_RECONNECT_PENDING.store(false, Ordering::SeqCst);
+                if let Ok(mut led) = led_for_wifi.lock() {
+                    let _ = led.set_pixel(RGB8::new(0, 32, 0)); // green indicates STA link up
+                }
             }
             WifiEvent::ApStaConnected(conn) => {
+                let mac = conn.mac();
+                let prev_ip = LAST_KNOWN_IPS
+                    .lock()
+                    .ok()
+                    .and_then(|mut last| last.remove(&mac));
+
+                if let Some(prev_ip) = prev_ip {
+                    if let Ok(mut map) = client_ips_for_wifi.lock() {
+                        map.insert(mac, prev_ip);
+                    }
+                }
                 if let Some(manager) = manager_for_wifi.as_ref() {
-                    let mac = conn.mac();
                     if let Ok(mut guard) = manager.lock() {
                         if let Err(err) = guard.handle_sta_connected(mac) {
                             warn!(
@@ -568,8 +588,18 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             WifiEvent::ApStaDisconnected(disc) => {
+                let mac = disc.mac();
+                let previous_ip = if let Ok(mut map) = client_ips_for_wifi.lock() {
+                    map.remove(&mac)
+                } else {
+                    None
+                };
+                if let Some(ip) = previous_ip {
+                    if let Ok(mut last) = LAST_KNOWN_IPS.lock() {
+                        last.insert(mac, ip);
+                    }
+                }
                 if let Some(manager) = manager_for_wifi.as_ref() {
-                    let mac = disc.mac();
                     if let Ok(mut guard) = manager.lock() {
                         if let Err(err) = guard.handle_sta_disconnected(mac) {
                             warn!(
@@ -612,6 +642,9 @@ fn main() -> anyhow::Result<()> {
             if let Ok(mut map) = client_ips_for_ip.lock() {
                 map.insert(mac, ip);
             }
+            if let Ok(mut last) = LAST_KNOWN_IPS.lock() {
+                last.insert(mac, ip);
+            }
             CLIENT_GOT_CONNECTED.store(true, Ordering::SeqCst);
         }
     })?;
@@ -653,12 +686,41 @@ fn main() -> anyhow::Result<()> {
             }
         })?;
 
+    let client_ips_for_rssi = Arc::clone(&client_ips);
+    const TABLE_OUTPUT_INTERVAL_SECS: u64 = 10;
+    const RSSI_COLLECTION_INTERVAL_MS: u32 = 1_000;
     thread::Builder::new()
         .name("sta_rssi_logger".into())
         .stack_size(4096)
-        .spawn(|| loop {
-            log_all_sta_distances();
-            FreeRtos::delay_ms(3_000);
+        .spawn(move || {
+            let mut rssi_stats: HashMap<[u8; 6], RssiRange> = HashMap::new();
+            let mut last_table = Instant::now();
+
+            loop {
+                match collect_sta_snapshots(&client_ips_for_rssi) {
+                    Ok(snapshots) => {
+                        for snap in &snapshots {
+                            rssi_stats
+                                .entry(snap.mac)
+                                .and_modify(|range| range.update(snap.rssi))
+                                .or_insert(RssiRange::new(snap.rssi));
+                        }
+
+                        if last_table.elapsed() >= Duration::from_secs(TABLE_OUTPUT_INTERVAL_SECS) {
+                            if let Some(table) = render_sta_table(&snapshots, &rssi_stats) {
+                                info!("\n{}", table);
+                            }
+                            rssi_stats.clear();
+                            last_table = Instant::now();
+                        }
+                    }
+                    Err(err) => {
+                        warn!("Failed to update STA stats: {:?}", err);
+                    }
+                }
+
+                FreeRtos::delay_ms(RSSI_COLLECTION_INTERVAL_MS);
+            }
         })?;
 
     let mut last_sta_reconnect_attempt: Option<Instant> = None;
@@ -707,6 +769,9 @@ fn main() -> anyhow::Result<()> {
 
             if should_attempt {
                 info!("STA reconnect timer elapsed – attempting to reconnect");
+                if let Ok(mut led_guard) = led.lock() {
+                    let _ = led_guard.set_pixel(RGB8::new(32, 0, 0)); // red while reconnecting
+                }
                 last_sta_reconnect_attempt = Some(Instant::now());
                 match create_sta_config() {
                     Ok(new_sta_cfg) => {
@@ -723,51 +788,52 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Log RSSI and distance for every connected station on the Soft‑AP.
-fn log_all_sta_distances() {
+fn collect_sta_snapshots(
+    client_ips: &Arc<Mutex<HashMap<[u8; 6], Ipv4Addr>>>,
+) -> anyhow::Result<Vec<StaSnapshot>> {
     unsafe {
         let mut sta_list: sys::wifi_sta_list_t = core::mem::zeroed();
-
         if sys::esp_wifi_ap_get_sta_list(&mut sta_list as *mut _) != sys::ESP_OK {
-            info!("Failed to fetch STA list for RSSI/dist logging");
-            return;
+            anyhow::bail!("Failed to fetch STA list for RSSI/dist logging");
         }
 
-        sta_list.sta[0..(sta_list.num as usize)]
+        let mut snapshots = Vec::new();
+
+        for sta in sta_list.sta[0..(sta_list.num as usize)]
             .iter()
-            .filter(|sta| sta.rssi != 0)  // Filter out entries with no RSSI data
-            .for_each(|sta| {
-                let rssi = sta.rssi as i8;
-                let distance_m = rssi_to_distance(
-                    rssi,
-                    MEASURED_POWER_DBM,
-                    PATH_LOSS_EXPONENT,
-                );
+            .filter(|sta| sta.rssi != 0)
+        {
+            let rssi = sta.rssi as RssiDbm;
+            let distance = rssi_to_distance(rssi, MEASURED_POWER_DBM, PATH_LOSS_EXPONENT);
+            let mac = sta.mac;
 
-                let mac = sta.mac;
-                let mac_key = mac; // treat it as a key: `[u8; 6]`
+            let name = {
+                let mut map = MAC_NAMES.lock().unwrap();
+                if let Some(existing) = map.get(&mac) {
+                    existing.clone()
+                } else {
+                    let mut pool = NAME_POOL.lock().unwrap();
+                    let candidate = pool.pop().unwrap_or_else(|| "nameless-device".into());
+                    map.insert(mac, candidate.clone());
+                    candidate
+                }
+            };
 
-                let human_name = {
-                    let mut map = MAC_NAMES.lock().unwrap();
-                    if let Some(name) = map.get(&mac_key) {
-                        name.clone()
-                    } else {
-                        let mut pool = NAME_POOL.lock().unwrap();
-                        let candidate = pool.pop().unwrap_or_else(|| "nameless-device".into());
-                        map.insert(mac_key, candidate.clone());
-                        candidate
-                    }
-                };
+            let ip = client_ips
+                .lock()
+                .ok()
+                .and_then(|ips| ips.get(&mac).copied());
 
-                info!(
-                    "📶 RSSI {:>3} dBm → ≈{:.1} m (client {} / {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x})",
-                    rssi,
-                    distance_m,
-                    human_name,
-                    mac[0], mac[1], mac[2],
-                    mac[3], mac[4], mac[5],
-                );
+            snapshots.push(StaSnapshot {
+                mac,
+                name,
+                rssi,
+                distance,
+                ip,
             });
+        }
+
+        Ok(snapshots)
     }
 }
 
