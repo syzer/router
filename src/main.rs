@@ -340,6 +340,7 @@ fn format_mac(mac: &[u8; 6]) -> String {
 
 // a global map MAC → human-readable name
 static MAC_NAMES: Lazy<Mutex<HashMap<[u8; 6], String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static LAST_KNOWN_IPS: Lazy<Mutex<HashMap<[u8; 6], Ipv4Addr>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 // Fresh pool of 100 names, regenerated every boot
 static NAME_POOL: Lazy<Mutex<Vec<String>>> = Lazy::new(|| {
@@ -536,6 +537,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     let manager_for_wifi = dhcp_manager.as_ref().map(Arc::clone);
+    let client_ips_for_wifi = Arc::clone(&client_ips);
     let _wifi_subscription =
         sysloop.subscribe::<WifiEvent, _>(move |event: WifiEvent| match event {
             WifiEvent::StaDisconnected(details) => {
@@ -561,8 +563,16 @@ fn main() -> anyhow::Result<()> {
                 STA_RECONNECT_PENDING.store(false, Ordering::SeqCst);
             }
             WifiEvent::ApStaConnected(conn) => {
+                let mac = conn.mac();
+                if let Ok(mut last) = LAST_KNOWN_IPS.lock() {
+                    if let Some(prev_ip) = last.remove(&mac) {
+                        drop(last);
+                        if let Ok(mut map) = client_ips_for_wifi.lock() {
+                            map.insert(mac, prev_ip);
+                        }
+                    }
+                }
                 if let Some(manager) = manager_for_wifi.as_ref() {
-                    let mac = conn.mac();
                     if let Ok(mut guard) = manager.lock() {
                         if let Err(err) = guard.handle_sta_connected(mac) {
                             warn!(
@@ -575,8 +585,18 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             WifiEvent::ApStaDisconnected(disc) => {
+                let mac = disc.mac();
+                let previous_ip = if let Ok(mut map) = client_ips_for_wifi.lock() {
+                    map.remove(&mac)
+                } else {
+                    None
+                };
+                if let Some(ip) = previous_ip {
+                    if let Ok(mut last) = LAST_KNOWN_IPS.lock() {
+                        last.insert(mac, ip);
+                    }
+                }
                 if let Some(manager) = manager_for_wifi.as_ref() {
-                    let mac = disc.mac();
                     if let Ok(mut guard) = manager.lock() {
                         if let Err(err) = guard.handle_sta_disconnected(mac) {
                             warn!(
@@ -618,6 +638,9 @@ fn main() -> anyhow::Result<()> {
 
             if let Ok(mut map) = client_ips_for_ip.lock() {
                 map.insert(mac, ip);
+            }
+            if let Ok(mut last) = LAST_KNOWN_IPS.lock() {
+                last.insert(mac, ip);
             }
             CLIENT_GOT_CONNECTED.store(true, Ordering::SeqCst);
         }
@@ -847,6 +870,11 @@ fn render_sta_table(
         ip: String,
     }
 
+    let mut ip_counts: HashMap<Option<Ipv4Addr>, usize> = HashMap::new();
+    for (snap, _) in &rows {
+        *ip_counts.entry(snap.ip).or_insert(0) += 1;
+    }
+
     let table_rows: Vec<TableRow> = rows
         .into_iter()
         .map(|(snap, (min_rssi, max_rssi))| TableRow {
@@ -854,10 +882,13 @@ fn render_sta_table(
             mac: format_mac(&snap.mac),
             rssi_range: format!("{min}..{max}", min = min_rssi, max = max_rssi),
             distance: format!("{:.1}", snap.distance),
-            ip: snap
-                .ip
-                .map(|ip| ip.to_string())
-                .unwrap_or_else(|| "-".into()),
+            ip: snap.ip.map_or_else(|| "-".into(), |ip| {
+                let mut display = ip.to_string();
+                if ip_counts.get(&Some(ip)).copied().unwrap_or(0) > 1 {
+                    display.push_str(" *");
+                }
+                display
+            }),
         })
         .collect();
 
