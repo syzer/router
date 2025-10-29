@@ -18,7 +18,7 @@ use esp_wifi_ap::{format_mac, render_sta_table, RssiDbm, RssiRange, StaSnapshot,
 use heapless::String as HeapString;
 use log::{info, warn};
 use once_cell::sync::Lazy;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::CStr;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU32;
@@ -87,6 +87,10 @@ struct DhcpReservationManager {
     network_base: u32,
     netmask: u32,
     broadcast: u32,
+    dynamic_assignments: HashMap<[u8; 6], u32>,
+    active_dynamic_hosts: HashSet<u32>,
+    next_dynamic_host: u32,
+    dynamic_end_host: u32,
 }
 
 unsafe impl Send for DhcpReservationManager {}
@@ -104,14 +108,15 @@ impl DhcpReservationManager {
         );
 
         let dynamic_start = Ipv4Addr::from(network_base + DYNAMIC_POOL_START);
-        let dynamic_end = Ipv4Addr::from(network_base + STATIC_POOL_START.saturating_sub(1));
+        let dynamic_end_host = STATIC_POOL_START.saturating_sub(1);
+        let dynamic_end = Ipv4Addr::from(network_base + dynamic_end_host);
         let desired_default = DhcpsLease::from_range(dynamic_start, dynamic_end);
         set_dhcp_lease(handle, &desired_default)?;
 
         let (start, end) = lease_range(&desired_default);
         info!("Captured default DHCP pool: {} – {}", start, end,);
 
-        Ok(Self {
+        let mut manager = Self {
             handle,
             default: desired_default,
             queue: VecDeque::new(),
@@ -119,7 +124,13 @@ impl DhcpReservationManager {
             network_base,
             netmask,
             broadcast,
-        })
+            dynamic_assignments: HashMap::new(),
+            active_dynamic_hosts: HashSet::new(),
+            next_dynamic_host: DYNAMIC_POOL_START,
+            dynamic_end_host,
+        };
+        manager.recalculate_dynamic_cursor();
+        Ok(manager)
     }
 
     fn handle_sta_connected(&mut self, mac: [u8; 6]) -> anyhow::Result<()> {
@@ -163,6 +174,11 @@ impl DhcpReservationManager {
             self.activate_next_in_queue()?;
         }
 
+        if let Some(host) = self.dynamic_assignments.remove(&mac) {
+            self.active_dynamic_hosts.remove(&host);
+            self.recalculate_dynamic_cursor();
+        }
+
         Ok(())
     }
 
@@ -182,6 +198,21 @@ impl DhcpReservationManager {
                 self.restore_default()?;
                 self.activate_next_in_queue()?;
             }
+        }
+
+        if DHCP_RESERVATIONS.contains_key(&mac) {
+            if let Some(previous) = self.dynamic_assignments.remove(&mac) {
+                self.active_dynamic_hosts.remove(&previous);
+                self.recalculate_dynamic_cursor();
+            }
+        } else if let Some(host) = self.host_id_from_ip(ip) {
+            if let Some(previous) = self.dynamic_assignments.insert(mac, host) {
+                if previous != host {
+                    self.active_dynamic_hosts.remove(&previous);
+                }
+            }
+            self.active_dynamic_hosts.insert(host);
+            self.recalculate_dynamic_cursor();
         }
 
         Ok(())
@@ -226,12 +257,51 @@ impl DhcpReservationManager {
             Ipv4Addr::from(self.network_base + max_reservable_host)
         );
 
-        let next = Ipv4Addr::from(ip_u32 + 1);
-        Ok(DhcpsLease::from_range(ip, next))
+        // IDF requires reservation pools to contain at least two addresses (start < end),
+        // so extend the range by one. The extra slot stays in the static band and we
+        // revert the pool immediately once the lease is confirmed.
+        let reservation_end_host = host_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Reservation IP {} would overflow subnet", ip))?;
+        let last_usable_host = max_reservable_host
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Invalid broadcast address calculation"))?;
+        anyhow::ensure!(
+            reservation_end_host <= last_usable_host,
+            "Reservation IP {} requires extending past {}, which is not allowed",
+            ip,
+            Ipv4Addr::from(
+                self.network_base
+                    .checked_add(last_usable_host)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid broadcast address calculation"))?
+            )
+        );
+
+        let reservation_end = Ipv4Addr::from(
+            self.network_base
+                .checked_add(reservation_end_host)
+                .ok_or_else(|| anyhow::anyhow!("Reservation IP {} exceeds subnet", ip))?,
+        );
+
+        Ok(DhcpsLease::from_range(ip, reservation_end))
     }
 
     fn restore_default(&mut self) -> anyhow::Result<()> {
         if self.active.is_some() {
+            let dynamic_start_host = self
+                .next_dynamic_host
+                .clamp(DYNAMIC_POOL_START, self.dynamic_end_host);
+            let dynamic_start = Ipv4Addr::from(
+                self.network_base
+                    .checked_add(dynamic_start_host)
+                    .ok_or_else(|| anyhow::anyhow!("Dynamic start exceeds subnet bounds"))?,
+            );
+            let dynamic_end = Ipv4Addr::from(
+                self.network_base
+                    .checked_add(self.dynamic_end_host)
+                    .ok_or_else(|| anyhow::anyhow!("Dynamic end exceeds subnet bounds"))?,
+            );
+            self.default = DhcpsLease::from_range(dynamic_start, dynamic_end);
             let (start, end) = lease_range(&self.default);
             info!("Restoring default DHCP pool {} – {}", start, end);
             set_dhcp_lease(self.handle, &self.default)?;
@@ -248,6 +318,46 @@ impl DhcpReservationManager {
             }
         }
         Ok(())
+    }
+
+    fn host_id_from_ip(&self, ip: Ipv4Addr) -> Option<u32> {
+        let ip_u32 = u32::from(ip);
+        if (ip_u32 & self.netmask) != self.network_base {
+            return None;
+        }
+        ip_u32
+            .checked_sub(self.network_base)
+            .filter(|host| *host >= DYNAMIC_POOL_START && *host <= self.dynamic_end_host)
+    }
+
+    fn recalculate_dynamic_cursor(&mut self) {
+        let pool_size = self
+            .dynamic_end_host
+            .saturating_sub(DYNAMIC_POOL_START)
+            .saturating_add(1);
+
+        if pool_size == 0 {
+            self.next_dynamic_host = DYNAMIC_POOL_START;
+            return;
+        }
+
+        let mut candidate = self
+            .next_dynamic_host
+            .clamp(DYNAMIC_POOL_START, self.dynamic_end_host);
+        for _ in 0..pool_size {
+            if !self.active_dynamic_hosts.contains(&candidate) {
+                self.next_dynamic_host = candidate;
+                return;
+            }
+            candidate = if candidate >= self.dynamic_end_host {
+                DYNAMIC_POOL_START
+            } else {
+                candidate + 1
+            };
+        }
+
+        // Pool fully occupied; fall back to the start so caller can decide how to handle exhaustion.
+        self.next_dynamic_host = DYNAMIC_POOL_START;
     }
 }
 
