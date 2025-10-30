@@ -38,6 +38,7 @@ This project provides two binaries:
 - **Feature flag**: `--features esp32s3`
 - **Architecture**: Xtensa LX7 dual-core @ 240 MHz
 - **Memory**: 512 KB SRAM, 384 KB ROM
+- **Measured Wi-Fi throughput (STA mode)**: ~4.5 Mbps down / ~5 Mbps up
 
 ### Key Differences
 | Feature | ESP32-C6 | ESP32-C3 | ESP32-S3 |

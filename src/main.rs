@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 use sys::esp_netif_napt_enable;
 
 use dhcp::{DhcpServerState, DHCP_RESERVATIONS};
+use esp_idf_sys::esp_wifi_deauth_sta;
 
 #[derive(Clone, Copy)]
 struct NetifHandle(*mut sys::esp_netif_t);
@@ -42,6 +43,7 @@ include!(concat!(env!("OUT_DIR"), "/dhcp_leases.rs"));
 static MAC_NAMES: Lazy<Mutex<HashMap<[u8; 6], String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static LAST_KNOWN_IPS: Lazy<Mutex<HashMap<[u8; 6], Ipv4Addr>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+static STA_AIDS: Lazy<Mutex<HashMap<[u8; 6], u16>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 // Fresh pool of 100 names, regenerated every boot
 static NAME_POOL: Lazy<Mutex<Vec<String>>> = Lazy::new(|| {
@@ -254,6 +256,9 @@ fn main() -> anyhow::Result<()> {
             }
             WifiEvent::ApStaConnected(conn) => {
                 let mac = conn.mac();
+                if let Ok(mut aids) = STA_AIDS.lock() {
+                    aids.insert(mac, u16::from(conn.aid()));
+                }
                 let prev_ip = LAST_KNOWN_IPS
                     .lock()
                     .ok()
@@ -276,6 +281,9 @@ fn main() -> anyhow::Result<()> {
             }
             WifiEvent::ApStaDisconnected(disc) => {
                 let mac = disc.mac();
+                if let Ok(mut aids) = STA_AIDS.lock() {
+                    aids.remove(&mac);
+                }
                 let previous_ip = if let Ok(mut map) = client_ips_for_wifi.lock() {
                     map.remove(&mac)
                 } else {
@@ -327,9 +335,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            if let Ok(mut map) = client_ips_for_ip.lock() {
-                map.insert(mac, ip);
-            }
+            resolve_ip_conflicts(&mac, ip, &client_ips_for_ip, &dhcp_state_for_ip);
             if let Ok(mut last) = LAST_KNOWN_IPS.lock() {
                 last.insert(mac, ip);
             }
@@ -522,6 +528,96 @@ fn collect_sta_snapshots(
         }
 
         Ok(snapshots)
+    }
+}
+
+fn resolve_ip_conflicts(
+    new_mac: &[u8; 6],
+    new_ip: Ipv4Addr,
+    client_ips: &Arc<Mutex<HashMap<[u8; 6], Ipv4Addr>>>,
+    dhcp_state: &Arc<Mutex<Option<DhcpServerState>>>,
+) {
+    if let Some(reserved_ip) = DHCP_RESERVATIONS.get(new_mac) {
+        if *reserved_ip != new_ip {
+            warn!(
+                "Reservation mismatch for {}: expected {}, got {}. Forcing reconnect.",
+                format_mac(new_mac),
+                reserved_ip,
+                new_ip
+            );
+            if let Ok(mut guard) = dhcp_state.lock() {
+                if let Some(state) = guard.as_ref() {
+                    state.enforce_static_ip(new_mac);
+                }
+            }
+            deauth_mac(new_mac);
+            if let Ok(mut map) = client_ips.lock() {
+                map.remove(new_mac);
+            }
+            return;
+        }
+    }
+
+    let mut conflict_mac: Option<[u8; 6]> = None;
+    if let Ok(map) = client_ips.lock() {
+        for (mac, ip) in map.iter() {
+            if mac != new_mac && *ip == new_ip {
+                conflict_mac = Some(*mac);
+                break;
+            }
+        }
+    }
+
+    if let Some(conflict) = conflict_mac {
+        let conflict_reserved = DHCP_RESERVATIONS.contains_key(&conflict);
+        let new_reserved = DHCP_RESERVATIONS.contains_key(new_mac);
+        let conflict_ip_reserved = DHCP_RESERVATIONS
+            .get(new_mac)
+            .map(|reserved| *reserved == new_ip)
+            .unwrap_or(false);
+
+        let target = if new_reserved && !conflict_reserved {
+            conflict
+        } else if conflict_reserved && !conflict_ip_reserved {
+            *new_mac
+        } else if !new_reserved && conflict_reserved {
+            *new_mac
+        } else {
+            conflict
+        };
+
+        if let Some(aid) = STA_AIDS
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&target).copied())
+        {
+            warn!(
+                "Deauthenticating {} to resolve IP {} conflict",
+                format_mac(&target),
+                new_ip
+            );
+            unsafe {
+                let err = esp_wifi_deauth_sta(aid);
+                if err != sys::ESP_OK {
+                    warn!(
+                        "Failed to deauth {} (AID {}): {:?}",
+                        format_mac(&target),
+                        aid,
+                        err
+                    );
+                }
+            }
+        } else {
+            warn!(
+                "Unable to deauth {} for IP {} conflict (missing AID entry)",
+                format_mac(&target),
+                new_ip
+            );
+        }
+    }
+
+    if let Ok(mut map) = client_ips.lock() {
+        map.insert(*new_mac, new_ip);
     }
 }
 
