@@ -545,11 +545,6 @@ fn resolve_ip_conflicts(
                 reserved_ip,
                 new_ip
             );
-            if let Ok(mut guard) = dhcp_state.lock() {
-                if let Some(state) = guard.as_ref() {
-                    state.enforce_static_ip(new_mac);
-                }
-            }
             deauth_mac(new_mac);
             if let Ok(mut map) = client_ips.lock() {
                 map.remove(new_mac);
@@ -618,6 +613,34 @@ fn resolve_ip_conflicts(
 
     if let Ok(mut map) = client_ips.lock() {
         map.insert(*new_mac, new_ip);
+    }
+}
+
+fn deauth_mac(mac: &[u8; 6]) {
+    let aid_opt = STA_AIDS.lock().ok().and_then(|map| map.get(mac).copied());
+    if let Some(aid) = aid_opt {
+        unsafe {
+            let err = esp_wifi_deauth_sta(aid);
+            if err != sys::ESP_OK {
+                warn!(
+                    "Failed to deauth {} (AID {}): {:?}",
+                    format_mac(mac),
+                    aid,
+                    err
+                );
+            } else {
+                info!(
+                    "Deauthenticated {} (AID {}) to force DHCP renewal",
+                    format_mac(mac),
+                    aid
+                );
+            }
+        }
+    } else {
+        warn!(
+            "Unable to deauth {} – missing association ID",
+            format_mac(mac)
+        );
     }
 }
 
