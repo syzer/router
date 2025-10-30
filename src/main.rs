@@ -1,3 +1,5 @@
+#[cfg(feature = "esp32s3")]
+use core::sync::atomic::AtomicU8;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::modem::Modem;
@@ -35,6 +37,7 @@ unsafe impl Send for NetifHandle {}
 unsafe impl Sync for NetifHandle {}
 
 mod dhcp;
+mod led;
 
 include!(concat!(env!("OUT_DIR"), "/wifi_networks.rs"));
 include!(concat!(env!("OUT_DIR"), "/dhcp_leases.rs"));
@@ -55,11 +58,19 @@ static NAME_POOL: Lazy<Mutex<Vec<String>>> = Lazy::new(|| {
     Mutex::new(v)
 });
 
+#[cfg(not(feature = "esp32s3"))]
 static CLIENT_GOT_CONNECTED: AtomicBool = AtomicBool::new(false); // for blinking led everytime someone connected
 static STA_RECONNECT_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "esp32s3")]
+static LED_BLINK_EVENT: AtomicU8 = AtomicU8::new(0);
 
 // Current Wi-Fi network index for STA mode (shared state)
 static CURRENT_NETWORK_INDEX: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "esp32s3")]
+const LED_EVENT_CONNECT: u8 = 1;
+#[cfg(feature = "esp32s3")]
+const LED_EVENT_DISCONNECT: u8 = 2;
 
 // --- RSSI‑to‑distance calibration constants -------------------------------
 /// RSSI you measure at exactly 1 m from the AP (calibrate for your room!)
@@ -160,10 +171,12 @@ fn main() -> anyhow::Result<()> {
     }
     // button end
 
-    let led = Arc::new(Mutex::new(WS2812RMT::new(
-        peripherals.pins.gpio8,   // ESP32‑C6 built‑in RGB LED
-        peripherals.rmt.channel0, // any free TX channel
-    )?));
+    let channel0 = peripherals.rmt.channel0;
+    #[cfg(feature = "esp32s3")]
+    let led_driver = led::create_status_led(peripherals.pins.gpio21, channel0)?;
+    #[cfg(not(feature = "esp32s3"))]
+    let led_driver = led::create_status_led(peripherals.pins.gpio8, channel0)?;
+    let led = Arc::new(Mutex::new(led_driver));
 
     info!(".....Booting up Wi-Fi AP + STA bridge........");
 
@@ -228,30 +241,70 @@ fn main() -> anyhow::Result<()> {
                     ssid, reason
                 );
                 STA_RECONNECT_PENDING.store(true, Ordering::SeqCst);
+                #[cfg(feature = "esp32s3")]
+                {
+                    LED_BLINK_EVENT.store(LED_EVENT_DISCONNECT, Ordering::SeqCst);
+                }
+                #[cfg(not(feature = "esp32s3"))]
                 if let Ok(mut led) = led_for_wifi.lock() {
-                    let _ = led.set_pixel(RGB8::new(32, 0, 0)); // red indicates reconnecting
+                    let color = led::color_red();
+                    info!(
+                        "Status LED -> red (reconnect) (r={}, g={}, b={})",
+                        color.r, color.g, color.b
+                    );
+                    let _ = led.set_pixel(color); // red indicates reconnecting
                 }
             }
             WifiEvent::StaStopped => {
                 warn!("STA interface stopped – scheduling reconnect");
                 STA_RECONNECT_PENDING.store(true, Ordering::SeqCst);
+                #[cfg(feature = "esp32s3")]
+                {
+                    LED_BLINK_EVENT.store(LED_EVENT_DISCONNECT, Ordering::SeqCst);
+                }
+                #[cfg(not(feature = "esp32s3"))]
                 if let Ok(mut led) = led_for_wifi.lock() {
-                    let _ = led.set_pixel(RGB8::new(32, 0, 0));
+                    let color = led::color_red();
+                    info!(
+                        "Status LED -> red (STA stopped) (r={}, g={}, b={})",
+                        color.r, color.g, color.b
+                    );
+                    let _ = led.set_pixel(color);
                 }
             }
             WifiEvent::StaBeaconTimeout => {
                 warn!("STA beacon timeout – scheduling reconnect");
                 STA_RECONNECT_PENDING.store(true, Ordering::SeqCst);
+                #[cfg(feature = "esp32s3")]
+                {
+                    LED_BLINK_EVENT.store(LED_EVENT_DISCONNECT, Ordering::SeqCst);
+                }
+                #[cfg(not(feature = "esp32s3"))]
                 if let Ok(mut led) = led_for_wifi.lock() {
-                    let _ = led.set_pixel(RGB8::new(32, 0, 0));
+                    let color = led::color_red();
+                    info!(
+                        "Status LED -> red (beacon timeout) (r={}, g={}, b={})",
+                        color.r, color.g, color.b
+                    );
+                    let _ = led.set_pixel(color);
                 }
             }
             WifiEvent::StaConnected(details) => {
                 let ssid = String::from_utf8_lossy(details.ssid());
                 info!("STA connected to `{}`", ssid);
                 STA_RECONNECT_PENDING.store(false, Ordering::SeqCst);
+                #[cfg(feature = "esp32s3")]
+                {
+                    LED_BLINK_EVENT.store(LED_EVENT_CONNECT, Ordering::SeqCst);
+                }
+                #[cfg(not(feature = "esp32s3"))]
                 if let Ok(mut led) = led_for_wifi.lock() {
-                    let _ = led.set_pixel(RGB8::new(0, 32, 0)); // green indicates STA link up
+                    let color = led::color_green();
+                    info!(
+                        "Status LED -> green (STA connected) (r={}, g={}, b={})",
+                        color.r, color.g, color.b
+                    );
+                    let _ = led.set_pixel(color); // green indicates STA link up
                 }
             }
             WifiEvent::ApStaConnected(conn) => {
@@ -339,6 +392,7 @@ fn main() -> anyhow::Result<()> {
             if let Ok(mut last) = LAST_KNOWN_IPS.lock() {
                 last.insert(mac, ip);
             }
+            #[cfg(not(feature = "esp32s3"))]
             CLIENT_GOT_CONNECTED.store(true, Ordering::SeqCst);
         }
     })?;
@@ -359,26 +413,85 @@ fn main() -> anyhow::Result<()> {
     enable_nat(&ap)?;
     info!("NAPT enabled – AP clients have Internet!");
 
-    // Spawn a dedicated task that blinks pink whenever CLIENT_GOT_CONNECTED is set
-    let led_task = led.clone();
-    thread::Builder::new()
-        .name("client_blink".into())
-        .stack_size(8192)
-        .spawn(move || {
-            loop {
+    #[cfg(not(feature = "esp32s3"))]
+    {
+        // Spawn a dedicated task that blinks pink whenever CLIENT_GOT_CONNECTED is set
+        let led_task = led.clone();
+        thread::Builder::new()
+            .name("client_blink".into())
+            .stack_size(8192)
+            .spawn(move || loop {
                 if CLIENT_GOT_CONNECTED.swap(false, Ordering::SeqCst) {
                     let mut led = led_task.lock().unwrap();
                     for _ in 0..5 {
-                        let _ = led.set_pixel(RGB8::new(0, 0, 0)); // off
+                        let color_off = led::color_off();
+                        info!(
+                            "Status LED -> off (blink cycle) (r={}, g={}, b={})",
+                            color_off.r, color_off.g, color_off.b
+                        );
+                        let _ = led.set_pixel(color_off);
                         FreeRtos::delay_ms(200);
-                        let _ = led.set_pixel(RGB8::new(25, 0, 25)); // pink
+                        let color_pink = led::color_pink();
+                        info!(
+                            "Status LED -> pink (blink cycle) (r={}, g={}, b={})",
+                            color_pink.r, color_pink.g, color_pink.b
+                        );
+                        let _ = led.set_pixel(color_pink);
                         FreeRtos::delay_ms(200);
                     }
                 } else {
                     FreeRtos::delay_ms(50);
                 }
-            }
-        })?;
+            })?;
+    }
+
+    #[cfg(feature = "esp32s3")]
+    {
+        let led_task = led.clone();
+        thread::Builder::new()
+            .name("status_led".into())
+            .stack_size(4096)
+            .spawn(move || loop {
+                let event = LED_BLINK_EVENT.swap(0, Ordering::SeqCst);
+                if event == LED_EVENT_CONNECT {
+                    let mut led = led_task.lock().unwrap();
+                    for idx in 0..3 {
+                        let color = led::color_green();
+                        info!(
+                            "Status LED -> green blink {}/3 (r={}, g={}, b={})",
+                            idx + 1,
+                            color.r,
+                            color.g,
+                            color.b
+                        );
+                        let _ = led.set_pixel(color);
+                        FreeRtos::delay_ms(150);
+                        let off = led::color_off();
+                        let _ = led.set_pixel(off);
+                        FreeRtos::delay_ms(150);
+                    }
+                } else if event == LED_EVENT_DISCONNECT {
+                    let mut led = led_task.lock().unwrap();
+                    for idx in 0..2 {
+                        let color = led::color_red();
+                        info!(
+                            "Status LED -> red blink {}/2 (r={}, g={}, b={})",
+                            idx + 1,
+                            color.r,
+                            color.g,
+                            color.b
+                        );
+                        let _ = led.set_pixel(color);
+                        FreeRtos::delay_ms(150);
+                        let off = led::color_off();
+                        let _ = led.set_pixel(off);
+                        FreeRtos::delay_ms(150);
+                    }
+                } else {
+                    FreeRtos::delay_ms(50);
+                }
+            })?;
+    }
 
     let client_ips_for_rssi = Arc::clone(&client_ips);
     const TABLE_OUTPUT_INTERVAL_SECS: u64 = 10;
@@ -425,7 +538,12 @@ fn main() -> anyhow::Result<()> {
             button.disable_interrupt()?;
             {
                 let mut led_guard = led.lock().unwrap();
-                led_guard.set_pixel(RGB8::new(32, 0, 0))?;
+                let color = led::color_red();
+                info!(
+                    "Status LED -> red (button pressed) (r={}, g={}, b={})",
+                    color.r, color.g, color.b
+                );
+                led_guard.set_pixel(color)?;
             }
 
             // Switch to next network and reconnect
@@ -449,7 +567,12 @@ fn main() -> anyhow::Result<()> {
             FreeRtos::delay_ms(5_000);
             {
                 let mut led_guard = led.lock().unwrap();
-                led_guard.set_pixel(RGB8::new(0, 32, 0))?;
+                let color = led::color_green();
+                info!(
+                    "Status LED -> green (button release) (r={}, g={}, b={})",
+                    color.r, color.g, color.b
+                );
+                led_guard.set_pixel(color)?;
             }
         } else {
             button.disable_interrupt()?;
@@ -464,7 +587,12 @@ fn main() -> anyhow::Result<()> {
             if should_attempt {
                 info!("STA reconnect timer elapsed – attempting to reconnect");
                 if let Ok(mut led_guard) = led.lock() {
-                    let _ = led_guard.set_pixel(RGB8::new(32, 0, 0)); // red while reconnecting
+                    let color = led::color_red();
+                    info!(
+                        "Status LED -> red (reconnect attempt) (r={}, g={}, b={})",
+                        color.r, color.g, color.b
+                    );
+                    let _ = led_guard.set_pixel(color);
                 }
                 last_sta_reconnect_attempt = Some(Instant::now());
                 match create_sta_config() {
@@ -535,7 +663,7 @@ fn resolve_ip_conflicts(
     new_mac: &[u8; 6],
     new_ip: Ipv4Addr,
     client_ips: &Arc<Mutex<HashMap<[u8; 6], Ipv4Addr>>>,
-    dhcp_state: &Arc<Mutex<Option<DhcpServerState>>>,
+    _dhcp_state: &Arc<Mutex<Option<DhcpServerState>>>,
 ) {
     if let Some(reserved_ip) = DHCP_RESERVATIONS.get(new_mac) {
         if *reserved_ip != new_ip {
