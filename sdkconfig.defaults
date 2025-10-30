@@ -38,6 +38,7 @@ CONFIG_LWIP_IPV4_NAPT=y
 # Allow more simultaneous SoftAP clients (default is 10)
 CONFIG_ESP_WIFI_SOFTAP_MAX_CONN=16
 CONFIG_ESP_WIFI_MAX_CONN=16
+CONFIG_LWIP_DHCPS_MAX_STATION_NUM=32
 # ESP-NOW encrypted peers share HW key slots with SoftAP stations; keep at 0 unless needed
 CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM=0
 CONFIG_LWIP_IPV4_NAPT_PORTMAP=y

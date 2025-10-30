@@ -1,4 +1,3 @@
-use core::ffi::c_void;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::modem::Modem;
@@ -13,13 +12,11 @@ use esp_idf_svc::netif::IpEvent;
 use esp_idf_svc::nvs::*;
 use esp_idf_svc::wifi::*;
 use esp_idf_sys as sys;
-use esp_idf_sys::ESP_OK;
 use esp_wifi_ap::{format_mac, render_sta_table, RssiDbm, RssiRange, StaSnapshot, RGB8, WS2812RMT};
 use heapless::String as HeapString;
 use log::{info, warn};
 use once_cell::sync::Lazy;
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::ffi::CStr;
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU32;
 use std::ptr;
@@ -28,412 +25,18 @@ use std::thread;
 use std::time::{Duration, Instant};
 use sys::esp_netif_napt_enable;
 
+use dhcp::{DhcpServerState, DHCP_RESERVATIONS};
+
+#[derive(Clone, Copy)]
+struct NetifHandle(*mut sys::esp_netif_t);
+
+unsafe impl Send for NetifHandle {}
+unsafe impl Sync for NetifHandle {}
+
+mod dhcp;
+
 include!(concat!(env!("OUT_DIR"), "/wifi_networks.rs"));
 include!(concat!(env!("OUT_DIR"), "/dhcp_leases.rs"));
-
-const DYNAMIC_POOL_START: u32 = 2;
-const STATIC_POOL_START: u32 = 100;
-
-static DHCP_RESERVATIONS: Lazy<HashMap<[u8; 6], Ipv4Addr>> = Lazy::new(|| {
-    let mut map = HashMap::new();
-    for lease in STATIC_LEASES {
-        map.insert(
-            lease.mac,
-            Ipv4Addr::new(lease.ip[0], lease.ip[1], lease.ip[2], lease.ip[3]),
-        );
-    }
-    map
-});
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct DhcpsLease {
-    enable: bool,
-    start_ip: sys::ip4_addr_t,
-    end_ip: sys::ip4_addr_t,
-}
-
-impl Default for DhcpsLease {
-    fn default() -> Self {
-        Self {
-            enable: false,
-            start_ip: sys::ip4_addr_t { addr: 0 },
-            end_ip: sys::ip4_addr_t { addr: 0 },
-        }
-    }
-}
-
-impl DhcpsLease {
-    fn from_range(start: Ipv4Addr, end: Ipv4Addr) -> Self {
-        Self {
-            enable: true,
-            start_ip: ip4_from_ipv4(start),
-            end_ip: ip4_from_ipv4(end),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ActiveOverride {
-    mac: [u8; 6],
-    ip: Ipv4Addr,
-}
-
-struct DhcpReservationManager {
-    handle: *mut sys::esp_netif_t,
-    default: DhcpsLease,
-    queue: VecDeque<[u8; 6]>,
-    active: Option<ActiveOverride>,
-    network_base: u32,
-    netmask: u32,
-    broadcast: u32,
-    dynamic_assignments: HashMap<[u8; 6], u32>,
-    active_dynamic_hosts: HashSet<u32>,
-    next_dynamic_host: u32,
-    dynamic_end_host: u32,
-}
-
-unsafe impl Send for DhcpReservationManager {}
-
-impl DhcpReservationManager {
-    fn new(handle: *mut sys::esp_netif_t) -> anyhow::Result<Self> {
-        let ip_info = fetch_ip_info(handle)?;
-        let netmask = u32::from(esp_ip4_to_ipv4(ip_info.netmask));
-        let network_base = u32::from(esp_ip4_to_ipv4(ip_info.ip)) & netmask;
-        let broadcast = network_base | (!netmask);
-
-        anyhow::ensure!(
-            STATIC_POOL_START > DYNAMIC_POOL_START,
-            "Static pool start must exceed dynamic pool start"
-        );
-
-        let dynamic_start = Ipv4Addr::from(network_base + DYNAMIC_POOL_START);
-        let dynamic_end_host = STATIC_POOL_START.saturating_sub(1);
-        let dynamic_end = Ipv4Addr::from(network_base + dynamic_end_host);
-        let desired_default = DhcpsLease::from_range(dynamic_start, dynamic_end);
-        set_dhcp_lease(handle, &desired_default)?;
-
-        let (start, end) = lease_range(&desired_default);
-        info!("Captured default DHCP pool: {} – {}", start, end,);
-
-        let mut manager = Self {
-            handle,
-            default: desired_default,
-            queue: VecDeque::new(),
-            active: None,
-            network_base,
-            netmask,
-            broadcast,
-            dynamic_assignments: HashMap::new(),
-            active_dynamic_hosts: HashSet::new(),
-            next_dynamic_host: DYNAMIC_POOL_START,
-            dynamic_end_host,
-        };
-        manager.recalculate_dynamic_cursor();
-        Ok(manager)
-    }
-
-    fn handle_sta_connected(&mut self, mac: [u8; 6]) -> anyhow::Result<()> {
-        let Some(&ip) = DHCP_RESERVATIONS.get(&mac) else {
-            return Ok(());
-        };
-
-        if self
-            .active
-            .as_ref()
-            .map(|current| current.mac == mac)
-            .unwrap_or(false)
-        {
-            return Ok(());
-        }
-
-        if self.active.is_some() {
-            if !self.queue.iter().any(|queued| queued == &mac) {
-                self.queue.push_back(mac);
-                info!(
-                    "Queued DHCP override for {} (waiting for current reservation to finish)",
-                    format_mac(&mac)
-                );
-            }
-            return Ok(());
-        }
-
-        self.apply_override(mac, ip)
-    }
-
-    fn handle_sta_disconnected(&mut self, mac: [u8; 6]) -> anyhow::Result<()> {
-        self.queue.retain(|queued| queued != &mac);
-
-        if self
-            .active
-            .as_ref()
-            .map(|current| current.mac == mac)
-            .unwrap_or(false)
-        {
-            self.restore_default()?;
-            self.activate_next_in_queue()?;
-        }
-
-        if let Some(host) = self.dynamic_assignments.remove(&mac) {
-            self.active_dynamic_hosts.remove(&host);
-            self.recalculate_dynamic_cursor();
-        }
-
-        Ok(())
-    }
-
-    fn handle_ip_assigned(&mut self, mac: [u8; 6], ip: Ipv4Addr) -> anyhow::Result<()> {
-        if let Some(active) = self.active {
-            if active.mac == mac {
-                if active.ip != ip {
-                    warn!(
-                        "Reservation mismatch for {}: expected {}, got {}",
-                        format_mac(&mac),
-                        active.ip,
-                        ip
-                    );
-                } else {
-                    info!("Reserved IP {} confirmed for {}", ip, format_mac(&mac));
-                }
-                self.restore_default()?;
-                self.activate_next_in_queue()?;
-            }
-        }
-
-        if DHCP_RESERVATIONS.contains_key(&mac) {
-            if let Some(previous) = self.dynamic_assignments.remove(&mac) {
-                self.active_dynamic_hosts.remove(&previous);
-                self.recalculate_dynamic_cursor();
-            }
-        } else if let Some(host) = self.host_id_from_ip(ip) {
-            if let Some(previous) = self.dynamic_assignments.insert(mac, host) {
-                if previous != host {
-                    self.active_dynamic_hosts.remove(&previous);
-                }
-            }
-            self.active_dynamic_hosts.insert(host);
-            self.recalculate_dynamic_cursor();
-        }
-
-        Ok(())
-    }
-
-    fn apply_override(&mut self, mac: [u8; 6], ip: Ipv4Addr) -> anyhow::Result<()> {
-        let lease = self.make_reservation(ip)?;
-        set_dhcp_lease(self.handle, &lease)?;
-        info!("Temporarily pinning {} to {}", format_mac(&mac), ip);
-        self.active = Some(ActiveOverride { mac, ip });
-        Ok(())
-    }
-
-    fn make_reservation(&self, ip: Ipv4Addr) -> anyhow::Result<DhcpsLease> {
-        let ip_u32 = u32::from(ip);
-        anyhow::ensure!(
-            (ip_u32 & self.netmask) == self.network_base,
-            "Reservation IP {} must be within the AP subnet",
-            ip
-        );
-
-        let host_id = ip_u32
-            .checked_sub(self.network_base)
-            .ok_or_else(|| anyhow::anyhow!("Reservation IP {} underflows network base", ip))?;
-
-        anyhow::ensure!(
-            host_id >= STATIC_POOL_START,
-            "Reservation IP {} must be >= {}",
-            ip,
-            Ipv4Addr::from(self.network_base + STATIC_POOL_START)
-        );
-
-        let max_reservable_host = (self
-            .broadcast
-            .checked_sub(self.network_base)
-            .ok_or_else(|| anyhow::anyhow!("Invalid broadcast address calculation"))?)
-        .saturating_sub(2);
-        anyhow::ensure!(
-            host_id <= max_reservable_host,
-            "Reservation IP {} must be <= {}",
-            ip,
-            Ipv4Addr::from(self.network_base + max_reservable_host)
-        );
-
-        // IDF requires reservation pools to contain at least two addresses (start < end),
-        // so extend the range by one. The extra slot stays in the static band and we
-        // revert the pool immediately once the lease is confirmed.
-        let reservation_end_host = host_id
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("Reservation IP {} would overflow subnet", ip))?;
-        let last_usable_host = max_reservable_host
-            .checked_add(1)
-            .ok_or_else(|| anyhow::anyhow!("Invalid broadcast address calculation"))?;
-        anyhow::ensure!(
-            reservation_end_host <= last_usable_host,
-            "Reservation IP {} requires extending past {}, which is not allowed",
-            ip,
-            Ipv4Addr::from(
-                self.network_base
-                    .checked_add(last_usable_host)
-                    .ok_or_else(|| anyhow::anyhow!("Invalid broadcast address calculation"))?
-            )
-        );
-
-        let reservation_end = Ipv4Addr::from(
-            self.network_base
-                .checked_add(reservation_end_host)
-                .ok_or_else(|| anyhow::anyhow!("Reservation IP {} exceeds subnet", ip))?,
-        );
-
-        Ok(DhcpsLease::from_range(ip, reservation_end))
-    }
-
-    fn restore_default(&mut self) -> anyhow::Result<()> {
-        if self.active.is_some() {
-            let dynamic_start_host = self
-                .next_dynamic_host
-                .clamp(DYNAMIC_POOL_START, self.dynamic_end_host);
-            let dynamic_start = Ipv4Addr::from(
-                self.network_base
-                    .checked_add(dynamic_start_host)
-                    .ok_or_else(|| anyhow::anyhow!("Dynamic start exceeds subnet bounds"))?,
-            );
-            let dynamic_end = Ipv4Addr::from(
-                self.network_base
-                    .checked_add(self.dynamic_end_host)
-                    .ok_or_else(|| anyhow::anyhow!("Dynamic end exceeds subnet bounds"))?,
-            );
-            self.default = DhcpsLease::from_range(dynamic_start, dynamic_end);
-            let (start, end) = lease_range(&self.default);
-            info!("Restoring default DHCP pool {} – {}", start, end);
-            set_dhcp_lease(self.handle, &self.default)?;
-        }
-        self.active = None;
-        Ok(())
-    }
-
-    fn activate_next_in_queue(&mut self) -> anyhow::Result<()> {
-        while let Some(next_mac) = self.queue.pop_front() {
-            if let Some(&ip) = DHCP_RESERVATIONS.get(&next_mac) {
-                self.apply_override(next_mac, ip)?;
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    fn host_id_from_ip(&self, ip: Ipv4Addr) -> Option<u32> {
-        let ip_u32 = u32::from(ip);
-        if (ip_u32 & self.netmask) != self.network_base {
-            return None;
-        }
-        ip_u32
-            .checked_sub(self.network_base)
-            .filter(|host| *host >= DYNAMIC_POOL_START && *host <= self.dynamic_end_host)
-    }
-
-    fn recalculate_dynamic_cursor(&mut self) {
-        let pool_size = self
-            .dynamic_end_host
-            .saturating_sub(DYNAMIC_POOL_START)
-            .saturating_add(1);
-
-        if pool_size == 0 {
-            self.next_dynamic_host = DYNAMIC_POOL_START;
-            return;
-        }
-
-        let mut candidate = self
-            .next_dynamic_host
-            .clamp(DYNAMIC_POOL_START, self.dynamic_end_host);
-        for _ in 0..pool_size {
-            if !self.active_dynamic_hosts.contains(&candidate) {
-                self.next_dynamic_host = candidate;
-                return;
-            }
-            candidate = if candidate >= self.dynamic_end_host {
-                DYNAMIC_POOL_START
-            } else {
-                candidate + 1
-            };
-        }
-
-        // Pool fully occupied; fall back to the start so caller can decide how to handle exhaustion.
-        self.next_dynamic_host = DYNAMIC_POOL_START;
-    }
-}
-
-fn set_dhcp_lease(handle: *mut sys::esp_netif_t, lease: &DhcpsLease) -> anyhow::Result<()> {
-    let stop_err = unsafe { sys::esp_netif_dhcps_stop(handle) };
-    if stop_err != ESP_OK && stop_err != sys::ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED {
-        return Err(esp_error(stop_err));
-    }
-
-    let mut lease_copy = *lease;
-    let set_err = unsafe {
-        sys::esp_netif_dhcps_option(
-            handle,
-            sys::esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_SET,
-            sys::esp_netif_dhcp_option_id_t_ESP_NETIF_REQUESTED_IP_ADDRESS,
-            &mut lease_copy as *mut _ as *mut c_void,
-            core::mem::size_of::<DhcpsLease>() as u32,
-        )
-    };
-
-    let start_err = unsafe { sys::esp_netif_dhcps_start(handle) };
-    if start_err != ESP_OK && start_err != sys::ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED {
-        return Err(esp_error(start_err));
-    }
-
-    if set_err == ESP_OK {
-        Ok(())
-    } else {
-        Err(esp_error(set_err))
-    }
-}
-
-fn lease_range(lease: &DhcpsLease) -> (Ipv4Addr, Ipv4Addr) {
-    (ip4_to_ipv4(lease.start_ip), ip4_to_ipv4(lease.end_ip))
-}
-
-fn fetch_ip_info(handle: *mut sys::esp_netif_t) -> anyhow::Result<sys::esp_netif_ip_info_t> {
-    let mut info = sys::esp_netif_ip_info_t {
-        ip: sys::esp_ip4_addr_t { addr: 0 },
-        netmask: sys::esp_ip4_addr_t { addr: 0 },
-        gw: sys::esp_ip4_addr_t { addr: 0 },
-    };
-    let err = unsafe { sys::esp_netif_get_ip_info(handle, &mut info) };
-    if err == ESP_OK {
-        Ok(info)
-    } else {
-        Err(esp_error(err))
-    }
-}
-
-fn ip4_from_ipv4(ip: Ipv4Addr) -> sys::ip4_addr_t {
-    let addr = if cfg!(target_endian = "little") {
-        u32::from_le_bytes(ip.octets())
-    } else {
-        u32::from_be_bytes(ip.octets())
-    };
-    sys::ip4_addr_t { addr }
-}
-
-fn ip4_to_ipv4(ip: sys::ip4_addr_t) -> Ipv4Addr {
-    let bytes = if cfg!(target_endian = "little") {
-        ip.addr.to_le_bytes()
-    } else {
-        ip.addr.to_be_bytes()
-    };
-    Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3])
-}
-
-fn esp_ip4_to_ipv4(ip: sys::esp_ip4_addr_t) -> Ipv4Addr {
-    ip4_to_ipv4(sys::ip4_addr_t { addr: ip.addr })
-}
-
-fn esp_error(err: i32) -> anyhow::Error {
-    let name = unsafe { CStr::from_ptr(sys::esp_err_to_name(err)) }.to_string_lossy();
-    anyhow::anyhow!("ESP error {err}: {name}")
-}
 
 // a global map MAC → human-readable name
 static MAC_NAMES: Lazy<Mutex<HashMap<[u8; 6], String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
@@ -606,35 +209,11 @@ fn main() -> anyhow::Result<()> {
     wifi.connect()?;
 
     let ap = wifi.ap_netif();
+    let ap_handle = NetifHandle(ap.handle());
 
-    let dhcp_manager = if DHCP_RESERVATIONS.is_empty() {
-        None
-    } else {
-        match DhcpReservationManager::new(ap.handle()) {
-            Ok(manager) => Some(Arc::new(Mutex::new(manager))),
-            Err(err) => {
-                warn!(
-                    "Failed to initialize static DHCP reservations: {:?}. Reservations disabled.",
-                    err
-                );
-                None
-            }
-        }
-    };
+    let dhcp_state = Arc::new(Mutex::new(init_dhcp_state(ap_handle)));
 
-    match dhcp_manager.as_ref() {
-        Some(_) => info!(
-            "Static DHCP reservations enabled for {} device(s)",
-            DHCP_RESERVATIONS.len()
-        ),
-        None if DHCP_RESERVATIONS.is_empty() => info!("No static DHCP reservations configured"),
-        None => info!(
-            "Static DHCP reservations currently disabled ({} reservation(s) configured)",
-            DHCP_RESERVATIONS.len()
-        ),
-    }
-
-    let manager_for_wifi = dhcp_manager.as_ref().map(Arc::clone);
+    let dhcp_state_for_wifi = Arc::clone(&dhcp_state);
     let client_ips_for_wifi = Arc::clone(&client_ips);
     let led_for_wifi = Arc::clone(&led);
     let _wifi_subscription =
@@ -685,14 +264,12 @@ fn main() -> anyhow::Result<()> {
                         map.insert(mac, prev_ip);
                     }
                 }
-                if let Some(manager) = manager_for_wifi.as_ref() {
-                    if let Ok(mut guard) = manager.lock() {
-                        if let Err(err) = guard.handle_sta_connected(mac) {
-                            warn!(
-                                "Failed to schedule DHCP reservation for {}: {:?}",
-                                format_mac(&mac),
-                                err
-                            );
+                if DHCP_RESERVATIONS.contains_key(&mac) {
+                    if let Ok(mut guard) = dhcp_state_for_wifi.lock() {
+                        if ensure_dhcp_state(&mut guard, ap_handle) {
+                            if let Some(state) = guard.as_ref() {
+                                state.touch_static_lease(&mac);
+                            }
                         }
                     }
                 }
@@ -709,22 +286,23 @@ fn main() -> anyhow::Result<()> {
                         last.insert(mac, ip);
                     }
                 }
-                if let Some(manager) = manager_for_wifi.as_ref() {
-                    if let Ok(mut guard) = manager.lock() {
-                        if let Err(err) = guard.handle_sta_disconnected(mac) {
-                            warn!(
-                                "Failed to handle disconnect for {}: {:?}",
-                                format_mac(&mac),
-                                err
-                            );
-                        }
+            }
+            WifiEvent::ApStarted => {
+                if let Ok(mut guard) = dhcp_state_for_wifi.lock() {
+                    *guard = init_dhcp_state(ap_handle);
+                }
+            }
+            WifiEvent::ApStopped => {
+                if let Ok(mut guard) = dhcp_state_for_wifi.lock() {
+                    if guard.take().is_some() {
+                        info!("Static DHCP reservations suspended (SoftAP stopped)");
                     }
                 }
             }
             _ => {}
         })?;
 
-    let dhcp_manager_for_ip = dhcp_manager.clone();
+    let dhcp_state_for_ip = Arc::clone(&dhcp_state);
     let client_ips_for_ip = Arc::clone(&client_ips);
     let _ip_subscription = sysloop.subscribe::<IpEvent, _>(move |event: IpEvent| {
         if let IpEvent::ApStaIpAssigned(assignment) = event {
@@ -738,13 +316,13 @@ fn main() -> anyhow::Result<()> {
                 mac_str.to_lowercase()
             );
 
-            if let Some(manager) = dhcp_manager_for_ip.as_ref() {
-                if let Ok(mut guard) = manager.lock() {
-                    if let Err(err) = guard.handle_ip_assigned(mac, ip) {
-                        warn!(
-                            "Failed to finalize DHCP reservation for {}: {:?}",
-                            mac_str, err
-                        );
+            if let Ok(mut guard) = dhcp_state_for_ip.lock() {
+                if ensure_dhcp_state(&mut guard, ap_handle) {
+                    if let Some(state) = guard.as_ref() {
+                        state.clamp_dynamic_cursor();
+                        if DHCP_RESERVATIONS.contains_key(&mac) {
+                            state.touch_static_lease(&mac);
+                        }
                     }
                 }
             }
@@ -779,7 +357,7 @@ fn main() -> anyhow::Result<()> {
     let led_task = led.clone();
     thread::Builder::new()
         .name("client_blink".into())
-        .stack_size(2048)
+        .stack_size(8192)
         .spawn(move || {
             loop {
                 if CLIENT_GOT_CONNECTED.swap(false, Ordering::SeqCst) {
@@ -801,7 +379,7 @@ fn main() -> anyhow::Result<()> {
     const RSSI_COLLECTION_INTERVAL_MS: u32 = 1_000;
     thread::Builder::new()
         .name("sta_rssi_logger".into())
-        .stack_size(4096)
+        .stack_size(12288)
         .spawn(move || {
             let mut rssi_stats: HashMap<[u8; 6], RssiRange> = HashMap::new();
             let mut last_table = Instant::now();
@@ -944,6 +522,58 @@ fn collect_sta_snapshots(
         }
 
         Ok(snapshots)
+    }
+}
+
+fn init_dhcp_state(handle: NetifHandle) -> Option<DhcpServerState> {
+    if DHCP_RESERVATIONS.is_empty() {
+        info!("No static DHCP reservations configured");
+        return None;
+    }
+
+    match DhcpServerState::new(handle.0) {
+        Ok(state) => {
+            info!(
+                "Static DHCP reservations enabled for {} device(s)",
+                DHCP_RESERVATIONS.len()
+            );
+            Some(state)
+        }
+        Err(err) => {
+            warn!(
+                "Failed to initialize static DHCP reservations: {:?}. Reservations disabled.",
+                err
+            );
+            None
+        }
+    }
+}
+
+fn ensure_dhcp_state(state: &mut Option<DhcpServerState>, handle: NetifHandle) -> bool {
+    if state.is_some() {
+        return true;
+    }
+
+    if DHCP_RESERVATIONS.is_empty() {
+        return false;
+    }
+
+    match DhcpServerState::new(handle.0) {
+        Ok(new_state) => {
+            info!(
+                "Static DHCP reservations re-enabled for {} device(s)",
+                DHCP_RESERVATIONS.len()
+            );
+            *state = Some(new_state);
+            true
+        }
+        Err(err) => {
+            warn!(
+                "Failed to initialize static DHCP reservations: {:?}. Reservations disabled.",
+                err
+            );
+            false
+        }
     }
 }
 
