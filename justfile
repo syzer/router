@@ -9,11 +9,17 @@ build *args:
 build-c3 *args:
   MCU=esp32c3 cargo build --release --target riscv32imc-esp-espidf --features esp32c3 {{args}}
 
+build-s3 *args:
+  MCU=esp32s3 cargo build --release --target xtensa-esp32s3-espidf --features esp32s3 {{args}}
+
 flash:
   espflash flash --monitor --chip esp32c6 target/riscv32imac-esp-espidf/release/esp-wifi-ap
 
 flash-c3:
   espflash flash --monitor --chip esp32c3 target/riscv32imc-esp-espidf/release/esp-wifi-ap
+
+flash-s3:
+  espflash flash --monitor --chip esp32s3 target/xtensa-esp32s3-espidf/release/esp-wifi-ap
 
 # Default recipe (ESP32-C6)
 run *args:
@@ -45,6 +51,21 @@ release-c3 *args:
     # copy a colour-stripped log to the clipboard
     env MCU=esp32c3 cargo run --release --bin esp-wifi-ap --target riscv32imc-esp-espidf --features esp32c3 {{args}}
 
+# Run with ESP32-S3 
+run-s3 *args:
+    # Show coloured output in the terminal,
+    # copy a colour-stripped log to the clipboard
+    unbuffer env MCU=esp32s3 cargo run --bin esp-wifi-ap --target xtensa-esp32s3-espidf --features esp32s3 {{args}} 2>&1 \
+      | tee /dev/tty \
+      | sed -r 's/${COLOR_RE}//g' \
+      | pbcopy
+
+# Release with ESP32-S3 
+release-s3 *args:
+    # Show coloured output in the terminal,
+    # copy a colour-stripped log to the clipboard
+    env MCU=esp32s3 cargo run --release --bin esp-wifi-ap --target xtensa-esp32s3-espidf --features esp32s3 {{args}}
+
 # Run client (ESP32-C6)
 run-client *args:
     # Show coloured output in the terminal,
@@ -59,6 +80,15 @@ run-client-c3 *args:
     # Show coloured output in the terminal,
     # copy a colour-stripped log to the clipboard
     unbuffer env MCU=esp32c3 cargo run --bin esp-wifi-client --target riscv32imc-esp-espidf --features esp32c3 {{args}} 2>&1 \
+      | tee /dev/tty \
+      | sed -r 's/${COLOR_RE}//g' \
+      | pbcopy
+
+# Run client with ESP32-S3 
+run-client-s3 *args:
+    # Show coloured output in the terminal,
+    # copy a colour-stripped log to the clipboard
+    unbuffer env MCU=esp32s3 cargo run --bin esp-wifi-client --target xtensa-esp32s3-espidf --features esp32s3 {{args}} 2>&1 \
       | tee /dev/tty \
       | sed -r 's/${COLOR_RE}//g' \
       | pbcopy

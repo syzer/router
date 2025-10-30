@@ -1,4 +1,5 @@
-use core::ffi::c_void;
+#[cfg(feature = "esp32s3")]
+use core::sync::atomic::AtomicU8;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use esp_idf_svc::hal::delay::FreeRtos;
 use esp_idf_svc::hal::modem::Modem;
@@ -13,13 +14,11 @@ use esp_idf_svc::netif::IpEvent;
 use esp_idf_svc::nvs::*;
 use esp_idf_svc::wifi::*;
 use esp_idf_sys as sys;
-use esp_idf_sys::ESP_OK;
 use esp_wifi_ap::{format_mac, render_sta_table, RssiDbm, RssiRange, StaSnapshot, RGB8, WS2812RMT};
 use heapless::String as HeapString;
 use log::{info, warn};
 use once_cell::sync::Lazy;
-use std::collections::{HashMap, VecDeque};
-use std::ffi::CStr;
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU32;
 use std::ptr;
@@ -28,307 +27,26 @@ use std::thread;
 use std::time::{Duration, Instant};
 use sys::esp_netif_napt_enable;
 
+use dhcp::{DhcpServerState, DHCP_RESERVATIONS};
+use esp_idf_sys::esp_wifi_deauth_sta;
+
+#[derive(Clone, Copy)]
+struct NetifHandle(*mut sys::esp_netif_t);
+
+unsafe impl Send for NetifHandle {}
+unsafe impl Sync for NetifHandle {}
+
+mod dhcp;
+mod led;
+
 include!(concat!(env!("OUT_DIR"), "/wifi_networks.rs"));
 include!(concat!(env!("OUT_DIR"), "/dhcp_leases.rs"));
-
-const DYNAMIC_POOL_START: u32 = 2;
-const STATIC_POOL_START: u32 = 100;
-
-static DHCP_RESERVATIONS: Lazy<HashMap<[u8; 6], Ipv4Addr>> = Lazy::new(|| {
-    let mut map = HashMap::new();
-    for lease in STATIC_LEASES {
-        map.insert(
-            lease.mac,
-            Ipv4Addr::new(lease.ip[0], lease.ip[1], lease.ip[2], lease.ip[3]),
-        );
-    }
-    map
-});
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct DhcpsLease {
-    enable: bool,
-    start_ip: sys::ip4_addr_t,
-    end_ip: sys::ip4_addr_t,
-}
-
-impl Default for DhcpsLease {
-    fn default() -> Self {
-        Self {
-            enable: false,
-            start_ip: sys::ip4_addr_t { addr: 0 },
-            end_ip: sys::ip4_addr_t { addr: 0 },
-        }
-    }
-}
-
-impl DhcpsLease {
-    fn from_range(start: Ipv4Addr, end: Ipv4Addr) -> Self {
-        Self {
-            enable: true,
-            start_ip: ip4_from_ipv4(start),
-            end_ip: ip4_from_ipv4(end),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct ActiveOverride {
-    mac: [u8; 6],
-    ip: Ipv4Addr,
-}
-
-struct DhcpReservationManager {
-    handle: *mut sys::esp_netif_t,
-    default: DhcpsLease,
-    queue: VecDeque<[u8; 6]>,
-    active: Option<ActiveOverride>,
-    network_base: u32,
-    netmask: u32,
-    broadcast: u32,
-}
-
-unsafe impl Send for DhcpReservationManager {}
-
-impl DhcpReservationManager {
-    fn new(handle: *mut sys::esp_netif_t) -> anyhow::Result<Self> {
-        let ip_info = fetch_ip_info(handle)?;
-        let netmask = u32::from(esp_ip4_to_ipv4(ip_info.netmask));
-        let network_base = u32::from(esp_ip4_to_ipv4(ip_info.ip)) & netmask;
-        let broadcast = network_base | (!netmask);
-
-        anyhow::ensure!(
-            STATIC_POOL_START > DYNAMIC_POOL_START,
-            "Static pool start must exceed dynamic pool start"
-        );
-
-        let dynamic_start = Ipv4Addr::from(network_base + DYNAMIC_POOL_START);
-        let dynamic_end = Ipv4Addr::from(network_base + STATIC_POOL_START.saturating_sub(1));
-        let desired_default = DhcpsLease::from_range(dynamic_start, dynamic_end);
-        set_dhcp_lease(handle, &desired_default)?;
-
-        let (start, end) = lease_range(&desired_default);
-        info!("Captured default DHCP pool: {} – {}", start, end,);
-
-        Ok(Self {
-            handle,
-            default: desired_default,
-            queue: VecDeque::new(),
-            active: None,
-            network_base,
-            netmask,
-            broadcast,
-        })
-    }
-
-    fn handle_sta_connected(&mut self, mac: [u8; 6]) -> anyhow::Result<()> {
-        let Some(&ip) = DHCP_RESERVATIONS.get(&mac) else {
-            return Ok(());
-        };
-
-        if self
-            .active
-            .as_ref()
-            .map(|current| current.mac == mac)
-            .unwrap_or(false)
-        {
-            return Ok(());
-        }
-
-        if self.active.is_some() {
-            if !self.queue.iter().any(|queued| queued == &mac) {
-                self.queue.push_back(mac);
-                info!(
-                    "Queued DHCP override for {} (waiting for current reservation to finish)",
-                    format_mac(&mac)
-                );
-            }
-            return Ok(());
-        }
-
-        self.apply_override(mac, ip)
-    }
-
-    fn handle_sta_disconnected(&mut self, mac: [u8; 6]) -> anyhow::Result<()> {
-        self.queue.retain(|queued| queued != &mac);
-
-        if self
-            .active
-            .as_ref()
-            .map(|current| current.mac == mac)
-            .unwrap_or(false)
-        {
-            self.restore_default()?;
-            self.activate_next_in_queue()?;
-        }
-
-        Ok(())
-    }
-
-    fn handle_ip_assigned(&mut self, mac: [u8; 6], ip: Ipv4Addr) -> anyhow::Result<()> {
-        if let Some(active) = self.active {
-            if active.mac == mac {
-                if active.ip != ip {
-                    warn!(
-                        "Reservation mismatch for {}: expected {}, got {}",
-                        format_mac(&mac),
-                        active.ip,
-                        ip
-                    );
-                } else {
-                    info!("Reserved IP {} confirmed for {}", ip, format_mac(&mac));
-                }
-                self.restore_default()?;
-                self.activate_next_in_queue()?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn apply_override(&mut self, mac: [u8; 6], ip: Ipv4Addr) -> anyhow::Result<()> {
-        let lease = self.make_reservation(ip)?;
-        set_dhcp_lease(self.handle, &lease)?;
-        info!("Temporarily pinning {} to {}", format_mac(&mac), ip);
-        self.active = Some(ActiveOverride { mac, ip });
-        Ok(())
-    }
-
-    fn make_reservation(&self, ip: Ipv4Addr) -> anyhow::Result<DhcpsLease> {
-        let ip_u32 = u32::from(ip);
-        anyhow::ensure!(
-            (ip_u32 & self.netmask) == self.network_base,
-            "Reservation IP {} must be within the AP subnet",
-            ip
-        );
-
-        let host_id = ip_u32
-            .checked_sub(self.network_base)
-            .ok_or_else(|| anyhow::anyhow!("Reservation IP {} underflows network base", ip))?;
-
-        anyhow::ensure!(
-            host_id >= STATIC_POOL_START,
-            "Reservation IP {} must be >= {}",
-            ip,
-            Ipv4Addr::from(self.network_base + STATIC_POOL_START)
-        );
-
-        let max_reservable_host = (self
-            .broadcast
-            .checked_sub(self.network_base)
-            .ok_or_else(|| anyhow::anyhow!("Invalid broadcast address calculation"))?)
-        .saturating_sub(2);
-        anyhow::ensure!(
-            host_id <= max_reservable_host,
-            "Reservation IP {} must be <= {}",
-            ip,
-            Ipv4Addr::from(self.network_base + max_reservable_host)
-        );
-
-        let next = Ipv4Addr::from(ip_u32 + 1);
-        Ok(DhcpsLease::from_range(ip, next))
-    }
-
-    fn restore_default(&mut self) -> anyhow::Result<()> {
-        if self.active.is_some() {
-            let (start, end) = lease_range(&self.default);
-            info!("Restoring default DHCP pool {} – {}", start, end);
-            set_dhcp_lease(self.handle, &self.default)?;
-        }
-        self.active = None;
-        Ok(())
-    }
-
-    fn activate_next_in_queue(&mut self) -> anyhow::Result<()> {
-        while let Some(next_mac) = self.queue.pop_front() {
-            if let Some(&ip) = DHCP_RESERVATIONS.get(&next_mac) {
-                self.apply_override(next_mac, ip)?;
-                break;
-            }
-        }
-        Ok(())
-    }
-}
-
-fn set_dhcp_lease(handle: *mut sys::esp_netif_t, lease: &DhcpsLease) -> anyhow::Result<()> {
-    let stop_err = unsafe { sys::esp_netif_dhcps_stop(handle) };
-    if stop_err != ESP_OK && stop_err != sys::ESP_ERR_ESP_NETIF_DHCP_ALREADY_STOPPED {
-        return Err(esp_error(stop_err));
-    }
-
-    let mut lease_copy = *lease;
-    let set_err = unsafe {
-        sys::esp_netif_dhcps_option(
-            handle,
-            sys::esp_netif_dhcp_option_mode_t_ESP_NETIF_OP_SET,
-            sys::esp_netif_dhcp_option_id_t_ESP_NETIF_REQUESTED_IP_ADDRESS,
-            &mut lease_copy as *mut _ as *mut c_void,
-            core::mem::size_of::<DhcpsLease>() as u32,
-        )
-    };
-
-    let start_err = unsafe { sys::esp_netif_dhcps_start(handle) };
-    if start_err != ESP_OK && start_err != sys::ESP_ERR_ESP_NETIF_DHCP_ALREADY_STARTED {
-        return Err(esp_error(start_err));
-    }
-
-    if set_err == ESP_OK {
-        Ok(())
-    } else {
-        Err(esp_error(set_err))
-    }
-}
-
-fn lease_range(lease: &DhcpsLease) -> (Ipv4Addr, Ipv4Addr) {
-    (ip4_to_ipv4(lease.start_ip), ip4_to_ipv4(lease.end_ip))
-}
-
-fn fetch_ip_info(handle: *mut sys::esp_netif_t) -> anyhow::Result<sys::esp_netif_ip_info_t> {
-    let mut info = sys::esp_netif_ip_info_t {
-        ip: sys::esp_ip4_addr_t { addr: 0 },
-        netmask: sys::esp_ip4_addr_t { addr: 0 },
-        gw: sys::esp_ip4_addr_t { addr: 0 },
-    };
-    let err = unsafe { sys::esp_netif_get_ip_info(handle, &mut info) };
-    if err == ESP_OK {
-        Ok(info)
-    } else {
-        Err(esp_error(err))
-    }
-}
-
-fn ip4_from_ipv4(ip: Ipv4Addr) -> sys::ip4_addr_t {
-    let addr = if cfg!(target_endian = "little") {
-        u32::from_le_bytes(ip.octets())
-    } else {
-        u32::from_be_bytes(ip.octets())
-    };
-    sys::ip4_addr_t { addr }
-}
-
-fn ip4_to_ipv4(ip: sys::ip4_addr_t) -> Ipv4Addr {
-    let bytes = if cfg!(target_endian = "little") {
-        ip.addr.to_le_bytes()
-    } else {
-        ip.addr.to_be_bytes()
-    };
-    Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3])
-}
-
-fn esp_ip4_to_ipv4(ip: sys::esp_ip4_addr_t) -> Ipv4Addr {
-    ip4_to_ipv4(sys::ip4_addr_t { addr: ip.addr })
-}
-
-fn esp_error(err: i32) -> anyhow::Error {
-    let name = unsafe { CStr::from_ptr(sys::esp_err_to_name(err)) }.to_string_lossy();
-    anyhow::anyhow!("ESP error {err}: {name}")
-}
 
 // a global map MAC → human-readable name
 static MAC_NAMES: Lazy<Mutex<HashMap<[u8; 6], String>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 static LAST_KNOWN_IPS: Lazy<Mutex<HashMap<[u8; 6], Ipv4Addr>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
+static STA_AIDS: Lazy<Mutex<HashMap<[u8; 6], u16>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 // Fresh pool of 100 names, regenerated every boot
 static NAME_POOL: Lazy<Mutex<Vec<String>>> = Lazy::new(|| {
@@ -340,11 +58,19 @@ static NAME_POOL: Lazy<Mutex<Vec<String>>> = Lazy::new(|| {
     Mutex::new(v)
 });
 
+#[cfg(not(feature = "esp32s3"))]
 static CLIENT_GOT_CONNECTED: AtomicBool = AtomicBool::new(false); // for blinking led everytime someone connected
 static STA_RECONNECT_PENDING: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "esp32s3")]
+static LED_BLINK_EVENT: AtomicU8 = AtomicU8::new(0);
 
 // Current Wi-Fi network index for STA mode (shared state)
 static CURRENT_NETWORK_INDEX: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(feature = "esp32s3")]
+const LED_EVENT_CONNECT: u8 = 1;
+#[cfg(feature = "esp32s3")]
+const LED_EVENT_DISCONNECT: u8 = 2;
 
 // --- RSSI‑to‑distance calibration constants -------------------------------
 /// RSSI you measure at exactly 1 m from the AP (calibrate for your room!)
@@ -445,10 +171,12 @@ fn main() -> anyhow::Result<()> {
     }
     // button end
 
-    let led = Arc::new(Mutex::new(WS2812RMT::new(
-        peripherals.pins.gpio8,   // ESP32‑C6 built‑in RGB LED
-        peripherals.rmt.channel0, // any free TX channel
-    )?));
+    let channel0 = peripherals.rmt.channel0;
+    #[cfg(feature = "esp32s3")]
+    let led_driver = led::create_status_led(peripherals.pins.gpio21, channel0)?;
+    #[cfg(not(feature = "esp32s3"))]
+    let led_driver = led::create_status_led(peripherals.pins.gpio8, channel0)?;
+    let led = Arc::new(Mutex::new(led_driver));
 
     info!(".....Booting up Wi-Fi AP + STA bridge........");
 
@@ -496,35 +224,11 @@ fn main() -> anyhow::Result<()> {
     wifi.connect()?;
 
     let ap = wifi.ap_netif();
+    let ap_handle = NetifHandle(ap.handle());
 
-    let dhcp_manager = if DHCP_RESERVATIONS.is_empty() {
-        None
-    } else {
-        match DhcpReservationManager::new(ap.handle()) {
-            Ok(manager) => Some(Arc::new(Mutex::new(manager))),
-            Err(err) => {
-                warn!(
-                    "Failed to initialize static DHCP reservations: {:?}. Reservations disabled.",
-                    err
-                );
-                None
-            }
-        }
-    };
+    let dhcp_state = Arc::new(Mutex::new(init_dhcp_state(ap_handle)));
 
-    match dhcp_manager.as_ref() {
-        Some(_) => info!(
-            "Static DHCP reservations enabled for {} device(s)",
-            DHCP_RESERVATIONS.len()
-        ),
-        None if DHCP_RESERVATIONS.is_empty() => info!("No static DHCP reservations configured"),
-        None => info!(
-            "Static DHCP reservations currently disabled ({} reservation(s) configured)",
-            DHCP_RESERVATIONS.len()
-        ),
-    }
-
-    let manager_for_wifi = dhcp_manager.as_ref().map(Arc::clone);
+    let dhcp_state_for_wifi = Arc::clone(&dhcp_state);
     let client_ips_for_wifi = Arc::clone(&client_ips);
     let led_for_wifi = Arc::clone(&led);
     let _wifi_subscription =
@@ -537,34 +241,77 @@ fn main() -> anyhow::Result<()> {
                     ssid, reason
                 );
                 STA_RECONNECT_PENDING.store(true, Ordering::SeqCst);
+                #[cfg(feature = "esp32s3")]
+                {
+                    LED_BLINK_EVENT.store(LED_EVENT_DISCONNECT, Ordering::SeqCst);
+                }
+                #[cfg(not(feature = "esp32s3"))]
                 if let Ok(mut led) = led_for_wifi.lock() {
-                    let _ = led.set_pixel(RGB8::new(32, 0, 0)); // red indicates reconnecting
+                    let color = led::color_red();
+                    info!(
+                        "Status LED -> red (reconnect) (r={}, g={}, b={})",
+                        color.r, color.g, color.b
+                    );
+                    let _ = led.set_pixel(color); // red indicates reconnecting
                 }
             }
             WifiEvent::StaStopped => {
                 warn!("STA interface stopped – scheduling reconnect");
                 STA_RECONNECT_PENDING.store(true, Ordering::SeqCst);
+                #[cfg(feature = "esp32s3")]
+                {
+                    LED_BLINK_EVENT.store(LED_EVENT_DISCONNECT, Ordering::SeqCst);
+                }
+                #[cfg(not(feature = "esp32s3"))]
                 if let Ok(mut led) = led_for_wifi.lock() {
-                    let _ = led.set_pixel(RGB8::new(32, 0, 0));
+                    let color = led::color_red();
+                    info!(
+                        "Status LED -> red (STA stopped) (r={}, g={}, b={})",
+                        color.r, color.g, color.b
+                    );
+                    let _ = led.set_pixel(color);
                 }
             }
             WifiEvent::StaBeaconTimeout => {
                 warn!("STA beacon timeout – scheduling reconnect");
                 STA_RECONNECT_PENDING.store(true, Ordering::SeqCst);
+                #[cfg(feature = "esp32s3")]
+                {
+                    LED_BLINK_EVENT.store(LED_EVENT_DISCONNECT, Ordering::SeqCst);
+                }
+                #[cfg(not(feature = "esp32s3"))]
                 if let Ok(mut led) = led_for_wifi.lock() {
-                    let _ = led.set_pixel(RGB8::new(32, 0, 0));
+                    let color = led::color_red();
+                    info!(
+                        "Status LED -> red (beacon timeout) (r={}, g={}, b={})",
+                        color.r, color.g, color.b
+                    );
+                    let _ = led.set_pixel(color);
                 }
             }
             WifiEvent::StaConnected(details) => {
                 let ssid = String::from_utf8_lossy(details.ssid());
                 info!("STA connected to `{}`", ssid);
                 STA_RECONNECT_PENDING.store(false, Ordering::SeqCst);
+                #[cfg(feature = "esp32s3")]
+                {
+                    LED_BLINK_EVENT.store(LED_EVENT_CONNECT, Ordering::SeqCst);
+                }
+                #[cfg(not(feature = "esp32s3"))]
                 if let Ok(mut led) = led_for_wifi.lock() {
-                    let _ = led.set_pixel(RGB8::new(0, 32, 0)); // green indicates STA link up
+                    let color = led::color_green();
+                    info!(
+                        "Status LED -> green (STA connected) (r={}, g={}, b={})",
+                        color.r, color.g, color.b
+                    );
+                    let _ = led.set_pixel(color); // green indicates STA link up
                 }
             }
             WifiEvent::ApStaConnected(conn) => {
                 let mac = conn.mac();
+                if let Ok(mut aids) = STA_AIDS.lock() {
+                    aids.insert(mac, u16::from(conn.aid()));
+                }
                 let prev_ip = LAST_KNOWN_IPS
                     .lock()
                     .ok()
@@ -575,20 +322,21 @@ fn main() -> anyhow::Result<()> {
                         map.insert(mac, prev_ip);
                     }
                 }
-                if let Some(manager) = manager_for_wifi.as_ref() {
-                    if let Ok(mut guard) = manager.lock() {
-                        if let Err(err) = guard.handle_sta_connected(mac) {
-                            warn!(
-                                "Failed to schedule DHCP reservation for {}: {:?}",
-                                format_mac(&mac),
-                                err
-                            );
+                if DHCP_RESERVATIONS.contains_key(&mac) {
+                    if let Ok(mut guard) = dhcp_state_for_wifi.lock() {
+                        if ensure_dhcp_state(&mut guard, ap_handle) {
+                            if let Some(state) = guard.as_ref() {
+                                state.touch_static_lease(&mac);
+                            }
                         }
                     }
                 }
             }
             WifiEvent::ApStaDisconnected(disc) => {
                 let mac = disc.mac();
+                if let Ok(mut aids) = STA_AIDS.lock() {
+                    aids.remove(&mac);
+                }
                 let previous_ip = if let Ok(mut map) = client_ips_for_wifi.lock() {
                     map.remove(&mac)
                 } else {
@@ -599,22 +347,23 @@ fn main() -> anyhow::Result<()> {
                         last.insert(mac, ip);
                     }
                 }
-                if let Some(manager) = manager_for_wifi.as_ref() {
-                    if let Ok(mut guard) = manager.lock() {
-                        if let Err(err) = guard.handle_sta_disconnected(mac) {
-                            warn!(
-                                "Failed to handle disconnect for {}: {:?}",
-                                format_mac(&mac),
-                                err
-                            );
-                        }
+            }
+            WifiEvent::ApStarted => {
+                if let Ok(mut guard) = dhcp_state_for_wifi.lock() {
+                    *guard = init_dhcp_state(ap_handle);
+                }
+            }
+            WifiEvent::ApStopped => {
+                if let Ok(mut guard) = dhcp_state_for_wifi.lock() {
+                    if guard.take().is_some() {
+                        info!("Static DHCP reservations suspended (SoftAP stopped)");
                     }
                 }
             }
             _ => {}
         })?;
 
-    let dhcp_manager_for_ip = dhcp_manager.clone();
+    let dhcp_state_for_ip = Arc::clone(&dhcp_state);
     let client_ips_for_ip = Arc::clone(&client_ips);
     let _ip_subscription = sysloop.subscribe::<IpEvent, _>(move |event: IpEvent| {
         if let IpEvent::ApStaIpAssigned(assignment) = event {
@@ -628,23 +377,22 @@ fn main() -> anyhow::Result<()> {
                 mac_str.to_lowercase()
             );
 
-            if let Some(manager) = dhcp_manager_for_ip.as_ref() {
-                if let Ok(mut guard) = manager.lock() {
-                    if let Err(err) = guard.handle_ip_assigned(mac, ip) {
-                        warn!(
-                            "Failed to finalize DHCP reservation for {}: {:?}",
-                            mac_str, err
-                        );
+            if let Ok(mut guard) = dhcp_state_for_ip.lock() {
+                if ensure_dhcp_state(&mut guard, ap_handle) {
+                    if let Some(state) = guard.as_ref() {
+                        state.clamp_dynamic_cursor();
+                        if DHCP_RESERVATIONS.contains_key(&mac) {
+                            state.touch_static_lease(&mac);
+                        }
                     }
                 }
             }
 
-            if let Ok(mut map) = client_ips_for_ip.lock() {
-                map.insert(mac, ip);
-            }
+            resolve_ip_conflicts(&mac, ip, &client_ips_for_ip, &dhcp_state_for_ip);
             if let Ok(mut last) = LAST_KNOWN_IPS.lock() {
                 last.insert(mac, ip);
             }
+            #[cfg(not(feature = "esp32s3"))]
             CLIENT_GOT_CONNECTED.store(true, Ordering::SeqCst);
         }
     })?;
@@ -665,33 +413,92 @@ fn main() -> anyhow::Result<()> {
     enable_nat(&ap)?;
     info!("NAPT enabled – AP clients have Internet!");
 
-    // Spawn a dedicated task that blinks pink whenever CLIENT_GOT_CONNECTED is set
-    let led_task = led.clone();
-    thread::Builder::new()
-        .name("client_blink".into())
-        .stack_size(2048)
-        .spawn(move || {
-            loop {
+    #[cfg(not(feature = "esp32s3"))]
+    {
+        // Spawn a dedicated task that blinks pink whenever CLIENT_GOT_CONNECTED is set
+        let led_task = led.clone();
+        thread::Builder::new()
+            .name("client_blink".into())
+            .stack_size(8192)
+            .spawn(move || loop {
                 if CLIENT_GOT_CONNECTED.swap(false, Ordering::SeqCst) {
                     let mut led = led_task.lock().unwrap();
                     for _ in 0..5 {
-                        let _ = led.set_pixel(RGB8::new(0, 0, 0)); // off
+                        let color_off = led::color_off();
+                        info!(
+                            "Status LED -> off (blink cycle) (r={}, g={}, b={})",
+                            color_off.r, color_off.g, color_off.b
+                        );
+                        let _ = led.set_pixel(color_off);
                         FreeRtos::delay_ms(200);
-                        let _ = led.set_pixel(RGB8::new(25, 0, 25)); // pink
+                        let color_pink = led::color_pink();
+                        info!(
+                            "Status LED -> pink (blink cycle) (r={}, g={}, b={})",
+                            color_pink.r, color_pink.g, color_pink.b
+                        );
+                        let _ = led.set_pixel(color_pink);
                         FreeRtos::delay_ms(200);
                     }
                 } else {
                     FreeRtos::delay_ms(50);
                 }
-            }
-        })?;
+            })?;
+    }
+
+    #[cfg(feature = "esp32s3")]
+    {
+        let led_task = led.clone();
+        thread::Builder::new()
+            .name("status_led".into())
+            .stack_size(4096)
+            .spawn(move || loop {
+                let event = LED_BLINK_EVENT.swap(0, Ordering::SeqCst);
+                if event == LED_EVENT_CONNECT {
+                    let mut led = led_task.lock().unwrap();
+                    for idx in 0..3 {
+                        let color = led::color_green();
+                        info!(
+                            "Status LED -> green blink {}/3 (r={}, g={}, b={})",
+                            idx + 1,
+                            color.r,
+                            color.g,
+                            color.b
+                        );
+                        let _ = led.set_pixel(color);
+                        FreeRtos::delay_ms(150);
+                        let off = led::color_off();
+                        let _ = led.set_pixel(off);
+                        FreeRtos::delay_ms(150);
+                    }
+                } else if event == LED_EVENT_DISCONNECT {
+                    let mut led = led_task.lock().unwrap();
+                    for idx in 0..2 {
+                        let color = led::color_red();
+                        info!(
+                            "Status LED -> red blink {}/2 (r={}, g={}, b={})",
+                            idx + 1,
+                            color.r,
+                            color.g,
+                            color.b
+                        );
+                        let _ = led.set_pixel(color);
+                        FreeRtos::delay_ms(150);
+                        let off = led::color_off();
+                        let _ = led.set_pixel(off);
+                        FreeRtos::delay_ms(150);
+                    }
+                } else {
+                    FreeRtos::delay_ms(50);
+                }
+            })?;
+    }
 
     let client_ips_for_rssi = Arc::clone(&client_ips);
     const TABLE_OUTPUT_INTERVAL_SECS: u64 = 10;
     const RSSI_COLLECTION_INTERVAL_MS: u32 = 1_000;
     thread::Builder::new()
         .name("sta_rssi_logger".into())
-        .stack_size(4096)
+        .stack_size(12288)
         .spawn(move || {
             let mut rssi_stats: HashMap<[u8; 6], RssiRange> = HashMap::new();
             let mut last_table = Instant::now();
@@ -731,7 +538,12 @@ fn main() -> anyhow::Result<()> {
             button.disable_interrupt()?;
             {
                 let mut led_guard = led.lock().unwrap();
-                led_guard.set_pixel(RGB8::new(32, 0, 0))?;
+                let color = led::color_red();
+                info!(
+                    "Status LED -> red (button pressed) (r={}, g={}, b={})",
+                    color.r, color.g, color.b
+                );
+                led_guard.set_pixel(color)?;
             }
 
             // Switch to next network and reconnect
@@ -755,7 +567,12 @@ fn main() -> anyhow::Result<()> {
             FreeRtos::delay_ms(5_000);
             {
                 let mut led_guard = led.lock().unwrap();
-                led_guard.set_pixel(RGB8::new(0, 32, 0))?;
+                let color = led::color_green();
+                info!(
+                    "Status LED -> green (button release) (r={}, g={}, b={})",
+                    color.r, color.g, color.b
+                );
+                led_guard.set_pixel(color)?;
             }
         } else {
             button.disable_interrupt()?;
@@ -770,7 +587,12 @@ fn main() -> anyhow::Result<()> {
             if should_attempt {
                 info!("STA reconnect timer elapsed – attempting to reconnect");
                 if let Ok(mut led_guard) = led.lock() {
-                    let _ = led_guard.set_pixel(RGB8::new(32, 0, 0)); // red while reconnecting
+                    let color = led::color_red();
+                    info!(
+                        "Status LED -> red (reconnect attempt) (r={}, g={}, b={})",
+                        color.r, color.g, color.b
+                    );
+                    let _ = led_guard.set_pixel(color);
                 }
                 last_sta_reconnect_attempt = Some(Instant::now());
                 match create_sta_config() {
@@ -834,6 +656,171 @@ fn collect_sta_snapshots(
         }
 
         Ok(snapshots)
+    }
+}
+
+fn resolve_ip_conflicts(
+    new_mac: &[u8; 6],
+    new_ip: Ipv4Addr,
+    client_ips: &Arc<Mutex<HashMap<[u8; 6], Ipv4Addr>>>,
+    _dhcp_state: &Arc<Mutex<Option<DhcpServerState>>>,
+) {
+    if let Some(reserved_ip) = DHCP_RESERVATIONS.get(new_mac) {
+        if *reserved_ip != new_ip {
+            warn!(
+                "Reservation mismatch for {}: expected {}, got {}. Forcing reconnect.",
+                format_mac(new_mac),
+                reserved_ip,
+                new_ip
+            );
+            deauth_mac(new_mac);
+            if let Ok(mut map) = client_ips.lock() {
+                map.remove(new_mac);
+            }
+            return;
+        }
+    }
+
+    let mut conflict_mac: Option<[u8; 6]> = None;
+    if let Ok(map) = client_ips.lock() {
+        for (mac, ip) in map.iter() {
+            if mac != new_mac && *ip == new_ip {
+                conflict_mac = Some(*mac);
+                break;
+            }
+        }
+    }
+
+    if let Some(conflict) = conflict_mac {
+        let conflict_reserved = DHCP_RESERVATIONS.contains_key(&conflict);
+        let new_reserved = DHCP_RESERVATIONS.contains_key(new_mac);
+        let conflict_ip_reserved = DHCP_RESERVATIONS
+            .get(new_mac)
+            .map(|reserved| *reserved == new_ip)
+            .unwrap_or(false);
+
+        let target = if new_reserved && !conflict_reserved {
+            conflict
+        } else if conflict_reserved && !conflict_ip_reserved {
+            *new_mac
+        } else if !new_reserved && conflict_reserved {
+            *new_mac
+        } else {
+            conflict
+        };
+
+        if let Some(aid) = STA_AIDS
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&target).copied())
+        {
+            warn!(
+                "Deauthenticating {} to resolve IP {} conflict",
+                format_mac(&target),
+                new_ip
+            );
+            unsafe {
+                let err = esp_wifi_deauth_sta(aid);
+                if err != sys::ESP_OK {
+                    warn!(
+                        "Failed to deauth {} (AID {}): {:?}",
+                        format_mac(&target),
+                        aid,
+                        err
+                    );
+                }
+            }
+        } else {
+            warn!(
+                "Unable to deauth {} for IP {} conflict (missing AID entry)",
+                format_mac(&target),
+                new_ip
+            );
+        }
+    }
+
+    if let Ok(mut map) = client_ips.lock() {
+        map.insert(*new_mac, new_ip);
+    }
+}
+
+fn deauth_mac(mac: &[u8; 6]) {
+    let aid_opt = STA_AIDS.lock().ok().and_then(|map| map.get(mac).copied());
+    if let Some(aid) = aid_opt {
+        unsafe {
+            let err = esp_wifi_deauth_sta(aid);
+            if err != sys::ESP_OK {
+                warn!(
+                    "Failed to deauth {} (AID {}): {:?}",
+                    format_mac(mac),
+                    aid,
+                    err
+                );
+            } else {
+                info!(
+                    "Deauthenticated {} (AID {}) to force DHCP renewal",
+                    format_mac(mac),
+                    aid
+                );
+            }
+        }
+    } else {
+        warn!(
+            "Unable to deauth {} – missing association ID",
+            format_mac(mac)
+        );
+    }
+}
+
+fn init_dhcp_state(handle: NetifHandle) -> Option<DhcpServerState> {
+    if DHCP_RESERVATIONS.is_empty() {
+        info!("No static DHCP reservations configured");
+        return None;
+    }
+
+    match DhcpServerState::new(handle.0) {
+        Ok(state) => {
+            info!(
+                "Static DHCP reservations enabled for {} device(s)",
+                DHCP_RESERVATIONS.len()
+            );
+            Some(state)
+        }
+        Err(err) => {
+            warn!(
+                "Failed to initialize static DHCP reservations: {:?}. Reservations disabled.",
+                err
+            );
+            None
+        }
+    }
+}
+
+fn ensure_dhcp_state(state: &mut Option<DhcpServerState>, handle: NetifHandle) -> bool {
+    if state.is_some() {
+        return true;
+    }
+
+    if DHCP_RESERVATIONS.is_empty() {
+        return false;
+    }
+
+    match DhcpServerState::new(handle.0) {
+        Ok(new_state) => {
+            info!(
+                "Static DHCP reservations re-enabled for {} device(s)",
+                DHCP_RESERVATIONS.len()
+            );
+            *state = Some(new_state);
+            true
+        }
+        Err(err) => {
+            warn!(
+                "Failed to initialize static DHCP reservations: {:?}. Reservations disabled.",
+                err
+            );
+            false
+        }
     }
 }
 
