@@ -335,7 +335,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            resolve_ip_conflicts(&mac, ip, &client_ips_for_ip, &dhcp_state_for_ip);
+            resolve_ip_conflicts(&mac, ip, &client_ips_for_ip);
             if let Ok(mut last) = LAST_KNOWN_IPS.lock() {
                 last.insert(mac, ip);
             }
@@ -535,7 +535,6 @@ fn resolve_ip_conflicts(
     new_mac: &[u8; 6],
     new_ip: Ipv4Addr,
     client_ips: &Arc<Mutex<HashMap<[u8; 6], Ipv4Addr>>>,
-    dhcp_state: &Arc<Mutex<Option<DhcpServerState>>>,
 ) {
     if let Some(reserved_ip) = DHCP_RESERVATIONS.get(new_mac) {
         if *reserved_ip != new_ip {
